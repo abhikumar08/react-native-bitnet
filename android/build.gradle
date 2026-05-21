@@ -40,6 +40,28 @@ android {
   defaultConfig {
     minSdkVersion getExtOrDefault("minSdkVersion")
     targetSdkVersion getExtOrDefault("targetSdkVersion")
+    
+    // NEW: tell AGP to build C++ via CMake
+    externalNativeBuild {
+      cmake {
+        cppFlags "-std=c++17", "-fexceptions", "-frtti"
+        arguments "-DANDROID_STL=c++_shared"
+        abiFilters "arm64-v8a"   // only arm64 — see ADR-001
+      }
+    }
+
+    // NEW: bundle the prebuilt .so files into the APK
+    ndk {
+      abiFilters "arm64-v8a"
+    }
+  }
+
+  // NEW: point AGP at our CMakeLists.txt
+  externalNativeBuild {
+    cmake {
+      path "CMakeLists.txt"
+      version "3.22.1"
+    }
   }
 
   buildFeatures {

@@ -1,0 +1,255 @@
+// bitnet_engine.cpp
+//
+// Implementation of BitnetEngine. See bitnet_engine.h for the public contract
+// and ADR-002 for the design rationale (pimpl, single-threaded, std::function
+// callbacks, atomic cancellation).
+
+#include "bitnet_engine.h"
+
+#include "llama.h"
+
+#include "common.h"
+#include "sampling.h"
+
+#include <algorithm>
+#include <chrono>
+#include <mutex>
+#include <stdexcept>
+#include <iostream>
+
+namespace bitnet {
+
+namespace {
+
+// Read a GGUF metadata string by key. Returns empty string if absent.
+std::string read_meta_str(const llama_model* model, const char* key) {
+    char buf[256];
+    int32_t n = llama_model_meta_val_str(model, key, buf, sizeof(buf));
+    if (n < 0) return {};
+    const size_t len = std::min<size_t>(static_cast<size_t>(n), sizeof(buf) - 1);
+    return std::string(buf, len);
+}
+
+// llama_backend_init() is idempotent but cheap; std::call_once keeps it crisp
+// in case create() runs concurrently from a future multi-engine setup.
+void ensure_backend_initialized() {
+    static std::once_flag once;
+    std::call_once(once, []() { llama_backend_init(); });
+}
+
+}  // namespace
+
+// ============================================================================
+// Impl
+// ============================================================================
+
+struct BitnetEngine::Impl {
+    llama_model*    model = nullptr;
+    llama_context*  ctx   = nullptr;
+    ModelInfo       info;
+    std::atomic<bool> cancel_flag{false};
+
+    // Kept around so generate() can read n_batch without re-parsing config.
+    common_params base_params;
+
+    ~Impl() {
+        if (ctx)   { llama_free(ctx);         ctx   = nullptr; }
+        if (model) { llama_free_model(model); model = nullptr; }
+    }
+};
+
+// ============================================================================
+// create()
+// ============================================================================
+
+std::unique_ptr<BitnetEngine> BitnetEngine::create(const EngineConfig& config) {
+    ensure_backend_initialized();
+
+    common_params params;
+    params.model               = config.model_path;
+    params.n_ctx               = config.n_ctx;
+    params.n_batch             = config.n_batch;
+    params.cpuparams.n_threads = config.n_threads;
+    params.n_gpu_layers        = 0;     // ← ADD THIS LINE
+
+    common_init_result init = common_init_from_params(params);
+    if (init.model == nullptr || init.context == nullptr) {
+        if (init.context) llama_free(init.context);
+        if (init.model)   llama_free_model(init.model);
+        throw std::runtime_error("Failed to load model from " + config.model_path);
+    }
+
+    auto engine = std::unique_ptr<BitnetEngine>(new BitnetEngine());
+    engine->impl_->model       = init.model;
+    engine->impl_->ctx         = init.context;
+    engine->impl_->base_params = std::move(params);
+
+    engine->impl_->info.architecture     = read_meta_str(init.model, "general.architecture");
+    engine->impl_->info.n_vocab          = llama_n_vocab(init.model);
+    engine->impl_->info.n_ctx_train      = llama_n_ctx_train(init.model);
+    engine->impl_->info.n_embd           = llama_n_embd(init.model);
+    engine->impl_->info.model_size_bytes = static_cast<int64_t>(llama_model_size(init.model));
+
+    return engine;
+}
+
+// ============================================================================
+// Constructor / destructor
+// ============================================================================
+
+BitnetEngine::BitnetEngine() : impl_(std::make_unique<Impl>()) {}
+BitnetEngine::~BitnetEngine() = default;
+
+// ============================================================================
+// generate()
+// ============================================================================
+
+GenerationResult BitnetEngine::generate(
+    const std::string& prompt,
+    const GenerationParams& params,
+    const TokenCallback& on_token)
+{
+    impl_->cancel_flag.store(false, std::memory_order_relaxed);
+    const auto t_start = std::chrono::steady_clock::now();
+
+    GenerationResult result;
+    result.finish_reason = FinishReason::Length;
+
+    common_sampler_params sparams;
+    sparams.seed           = params.seed ? params.seed : LLAMA_DEFAULT_SEED;
+    sparams.temp           = params.temperature;
+    sparams.top_k          = params.top_k;
+    sparams.top_p          = params.top_p;
+    sparams.penalty_repeat = params.repeat_penalty;
+    sparams.penalty_last_n = params.repeat_last_n;
+
+    common_sampler* smpl = common_sampler_init(impl_->model, sparams);
+    if (!smpl) {
+        result.finish_reason = FinishReason::Error;
+        return result;
+    }
+
+    struct SamplerGuard {
+        common_sampler* s;
+        ~SamplerGuard() { if (s) common_sampler_free(s); }
+    } guard{smpl};
+
+    // Tokenize prompt (add_bos drives off model metadata).
+    std::vector<llama_token> prompt_tokens =
+        common_tokenize(impl_->ctx, prompt, /*add_special*/ false, /*parse_special*/ true);
+
+    if (prompt_tokens.empty()) {
+        throw std::runtime_error("prompt tokenized to zero tokens");
+    }
+
+    // Prompt prefill in chunks of n_batch.
+    const int n_batch = impl_->base_params.n_batch;
+    int n_past = 0;
+    for (size_t i = 0; i < prompt_tokens.size(); i += static_cast<size_t>(n_batch)) {
+        const int n_eval = static_cast<int>(
+            std::min<size_t>(static_cast<size_t>(n_batch), prompt_tokens.size() - i));
+
+        llama_batch batch = llama_batch_get_one(
+            prompt_tokens.data() + i, n_eval, n_past, /*seq_id*/ 0);
+
+        if (llama_decode(impl_->ctx, batch) != 0) {
+            throw std::runtime_error("llama_decode failed on prompt");
+        }
+
+        for (int k = 0; k < n_eval; k++) {
+            common_sampler_accept(smpl, prompt_tokens[i + k], /*accept_grammar=*/false);
+        }
+
+        n_past += n_eval;
+    }
+
+    // Token-by-token generation loop.
+    std::string accumulated_text;
+    int tokens_generated = 0;
+
+    while (tokens_generated < params.max_tokens) {
+        if (impl_->cancel_flag.load(std::memory_order_relaxed)) {
+            result.finish_reason = FinishReason::Cancelled;
+            break;
+        }
+
+        const llama_token id = common_sampler_sample(smpl, impl_->ctx, /*idx*/ -1);
+        common_sampler_accept(smpl, id, /*accept_grammar*/ true);
+
+        if (llama_token_is_eog(impl_->model, id)) {
+            result.finish_reason = FinishReason::EndOfSequence;
+            break;
+        }
+
+        std::string piece = common_token_to_piece(impl_->ctx, id, /*special*/ false);
+
+        // Stop-sequence match runs against the cumulative output so that
+        // sequences spanning multiple tokens still trigger.
+        bool hit_stop = false;
+        for (const auto& stop : params.stop_sequences) {
+            if (!stop.empty() && accumulated_text.find(stop) != std::string::npos) {
+                hit_stop = true;
+                break;
+            }
+        }
+        if (hit_stop) {
+            result.finish_reason = FinishReason::StopSequence;
+            break;
+        }
+
+        accumulated_text += piece;
+        if (on_token(piece) == CallbackResult::Stop) {
+            result.finish_reason = FinishReason::Cancelled;
+            break;
+        }
+
+        // Feed the sampled token back so the next sample sees fresh logits.
+        llama_token id_buf = id;
+        llama_batch next = llama_batch_get_one(&id_buf, 1, n_past, /*seq_id*/ 0);
+        if (llama_decode(impl_->ctx, next) != 0) {
+            throw std::runtime_error("llama_decode failed on generation step");
+        }
+        n_past++;
+        tokens_generated++;
+    }
+
+    result.text             = std::move(accumulated_text);
+    result.tokens_generated = tokens_generated;
+
+    const auto t_end = std::chrono::steady_clock::now();
+    result.wall_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        t_end - t_start).count();
+
+    return result;
+}
+
+// ============================================================================
+// cancel() / model_info()
+// ============================================================================
+
+void BitnetEngine::cancel() {
+    impl_->cancel_flag.store(true, std::memory_order_relaxed);
+}
+
+ModelInfo BitnetEngine::model_info() const {
+    return impl_->info;
+}
+
+std::string BitnetEngine::apply_chat_template(
+    const std::vector<ChatMessage>& messages,
+    bool add_assistant_header) const
+{
+    std::string result;
+    result += "<|begin_of_text|>";
+    for (const auto& m : messages) {
+        result += "<|start_header_id|>" + m.role + "<|end_header_id|>\n\n";
+        result += m.content;
+        result += "<|eot_id|>";
+    }
+    if (add_assistant_header) {
+        result += "<|start_header_id|>assistant<|end_header_id|>\n\n";
+    }
+    return result;
+}
+
+}  // namespace bitnet
