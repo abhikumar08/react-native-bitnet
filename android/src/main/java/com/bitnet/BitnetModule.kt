@@ -37,7 +37,10 @@ class BitnetModule(private val reactContext: ReactApplicationContext) :
     modelPath: String, nCtx: Int, nThreads: Int, nBatch: Int): Long
   private external fun nativeGenerate(
     handle: Long, prompt: String,
-    maxTokens: Int, temperature: Float, topK: Int, topP: Float, seed: Int): String
+    maxTokens: Int, temperature: Float, topK: Int, topP: Float, seed: Int,
+    stopSequencesJson: String,
+    repeatPenalty: Float, repeatLastN: Int,
+    frequencyPenalty: Float, presencePenalty: Float): String
   private external fun nativeCancelGeneration(handle: Long)
   private external fun nativeApplyChatTemplate(
     handle: Long, rolesJson: String, addAssistantHeader: Boolean): String
@@ -86,6 +89,9 @@ class BitnetModule(private val reactContext: ReactApplicationContext) :
   override fun generate(
     handle: Double, prompt: String,
     maxTokens: Double, temperature: Double, topK: Double, topP: Double, seed: Double,
+    stopSequencesJson: String,
+    repeatPenalty: Double, repeatLastN: Double,
+    frequencyPenalty: Double, presencePenalty: Double,
     promise: Promise
   ) {
     // Run on a background thread so we don't block the JS thread for tens of seconds.
@@ -94,7 +100,10 @@ class BitnetModule(private val reactContext: ReactApplicationContext) :
         val text = nativeGenerate(
           handle.toLong(), prompt,
           maxTokens.toInt(), temperature.toFloat(),
-          topK.toInt(), topP.toFloat(), seed.toInt())
+          topK.toInt(), topP.toFloat(), seed.toInt(),
+          stopSequencesJson,
+          repeatPenalty.toFloat(), repeatLastN.toInt(),
+          frequencyPenalty.toFloat(), presencePenalty.toFloat())
         promise.resolve(text)
       } catch (t: Throwable) {
         promise.reject("E_GEN_FAILED", t.message ?: "generate threw", t)

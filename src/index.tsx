@@ -31,6 +31,20 @@ export type GenerationParams = {
   topK?: number;
   topP?: number;
   seed?: number;
+  // OpenAI-style stop sequence(s). Match is trimmed from the returned text
+  // and is not emitted to onToken. Pass a single string or an array.
+  stop?: string | string[];
+  // llama.cpp-style multiplicative repeat penalty. 1.0 = disabled, > 1.0
+  // reduces repetition. Note: this is NOT the same math as OpenAI's
+  // frequencyPenalty — both are exposed so callers can pick the one that
+  // fits the model they're targeting.
+  repeatPenalty?: number;
+  // Window (in recent tokens) used by repeat / frequency / presence penalties.
+  // 0 disables, -1 means full context.
+  repeatLastN?: number;
+  // OpenAI-style additive penalties. 0.0 = disabled.
+  frequencyPenalty?: number;
+  presencePenalty?: number;
   onToken?: (token: string) => void; // streaming callback
 };
 
@@ -102,6 +116,9 @@ export class Engine {
       });
     }
 
+    const stopArray =
+      typeof params.stop === 'string' ? [params.stop] : (params.stop ?? []);
+
     try {
       return await NativeBitnet.generate(
         this.handle,
@@ -110,7 +127,12 @@ export class Engine {
         params.temperature ?? 0.8,
         params.topK ?? 40,
         params.topP ?? 0.95,
-        params.seed ?? 0
+        params.seed ?? 0,
+        JSON.stringify(stopArray),
+        params.repeatPenalty ?? 1.1,
+        params.repeatLastN ?? 64,
+        params.frequencyPenalty ?? 0.0,
+        params.presencePenalty ?? 0.0
       );
     } finally {
       subscription?.remove();

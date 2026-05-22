@@ -87,8 +87,18 @@ struct GenerationParams {
     /// penalty, > 1.0 reduces repetition.
     float repeat_penalty = 1.1f;
 
-    /// How many recent tokens to consider for the repeat penalty.
+    /// How many recent tokens to consider for the repeat / frequency / presence
+    /// penalties. 0 disables, -1 means "use the full context".
     int repeat_last_n = 64;
+
+    /// OpenAI-style frequency penalty. 0.0 = disabled. Penalizes tokens
+    /// proportionally to how often they have appeared in the recent window
+    /// (sized by repeat_last_n).
+    float frequency_penalty = 0.0f;
+
+    /// OpenAI-style presence penalty. 0.0 = disabled. Penalizes tokens that
+    /// have appeared at least once in the recent window, regardless of count.
+    float presence_penalty = 0.0f;
 
     /// Strings that, when emitted, cause generation to stop. Matched against the
     /// accumulated output string (not individual tokens), so multi-token stop

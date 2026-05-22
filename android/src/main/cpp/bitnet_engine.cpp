@@ -37,6 +37,42 @@ void ensure_backend_initialized() {
     std::call_once(once, []() { llama_backend_init(); });
 }
 
+// Returns the largest k <= want such that s[0..k) ends at a UTF-8 character
+// boundary — i.e. contains only complete multi-byte sequences. Used to ensure
+// the holdback buffer never emits a truncated multi-byte char to the streaming
+// callback. llama.cpp tokenizers can split a single multi-byte codepoint
+// across consecutive tokens, so token pieces (and any concatenation of them)
+// can end mid-character. Passing such bytes to JNI's NewStringUTF aborts the
+// process with "illegal continuation byte" since Modified UTF-8 requires
+// terminating sequences to be complete.
+size_t utf8_safe_prefix_len(const std::string& s, size_t want) {
+    if (want > s.size()) want = s.size();
+    if (want == 0) return 0;
+
+    // Walk backward from `want` skipping over any continuation bytes — these
+    // belong to a character whose start byte is earlier in the string.
+    size_t k = want;
+    while (k > 0) {
+        const unsigned char b = static_cast<unsigned char>(s[k - 1]);
+        if ((b & 0xC0) == 0x80) {  // continuation byte: 10xxxxxx
+            --k;
+            continue;
+        }
+        // b is a start byte. Determine the expected total length of the
+        // character it begins.
+        size_t expected;
+        if      ((b & 0x80) == 0x00) expected = 1;  // 0xxxxxxx
+        else if ((b & 0xE0) == 0xC0) expected = 2;  // 110xxxxx
+        else if ((b & 0xF0) == 0xE0) expected = 3;  // 1110xxxx
+        else if ((b & 0xF8) == 0xF0) expected = 4;  // 11110xxx
+        else { return k - 1; }                       // invalid start byte
+        const size_t have = want - (k - 1);
+        return have >= expected ? want : (k - 1);
+    }
+    // s[0..want) is entirely continuation bytes — emit nothing.
+    return 0;
+}
+
 }  // namespace
 
 // ============================================================================
@@ -116,12 +152,14 @@ GenerationResult BitnetEngine::generate(
     result.finish_reason = FinishReason::Length;
 
     common_sampler_params sparams;
-    sparams.seed           = params.seed ? params.seed : LLAMA_DEFAULT_SEED;
-    sparams.temp           = params.temperature;
-    sparams.top_k          = params.top_k;
-    sparams.top_p          = params.top_p;
-    sparams.penalty_repeat = params.repeat_penalty;
-    sparams.penalty_last_n = params.repeat_last_n;
+    sparams.seed            = params.seed ? params.seed : LLAMA_DEFAULT_SEED;
+    sparams.temp            = params.temperature;
+    sparams.top_k           = params.top_k;
+    sparams.top_p           = params.top_p;
+    sparams.penalty_repeat  = params.repeat_penalty;
+    sparams.penalty_last_n  = params.repeat_last_n;
+    sparams.penalty_freq    = params.frequency_penalty;
+    sparams.penalty_present = params.presence_penalty;
 
     common_sampler* smpl = common_sampler_init(impl_->model, sparams);
     if (!smpl) {
@@ -164,8 +202,47 @@ GenerationResult BitnetEngine::generate(
     }
 
     // Token-by-token generation loop.
+    //
+    // Stop sequences are honored OpenAI-style: when a stop string appears in
+    // the output, the matched substring (and anything after it within the
+    // current piece) is trimmed from the returned text and is NOT emitted to
+    // the streaming callback. To make this work across token boundaries — a
+    // stop string can straddle the seam between two pieces — we keep a small
+    // "holdback" suffix that is not yet committed to either the callback or
+    // accumulated_text. The held tail length covers two concerns:
+    //
+    //   (a) The longest possible incomplete stop-sequence prefix, so a stop
+    //       split across two pieces still triggers a match. That's
+    //       (max stop length - 1) bytes.
+    //
+    //   (b) The longest possible incomplete trailing UTF-8 character — up to
+    //       3 bytes for a 4-byte codepoint. Without this, the flush boundary
+    //       could split a multi-byte codepoint, and the JNI NewStringUTF call
+    //       on the resulting partial bytes would abort the process. This is
+    //       a real risk even with no stop sequences set, because llama.cpp's
+    //       tokenizers can split a single codepoint across consecutive tokens.
+    //
+    // We take the max of the two so a single uniform loop body handles both.
+    size_t max_stop_len = 0;
+    for (const auto& stop : params.stop_sequences) {
+        if (stop.size() > max_stop_len) max_stop_len = stop.size();
+    }
+    const size_t stop_holdback = max_stop_len > 0 ? max_stop_len - 1 : 0;
+    constexpr size_t utf8_max_partial = 3;
+    const size_t holdback = std::max(stop_holdback, utf8_max_partial);
+
     std::string accumulated_text;
+    std::string held;  // suffix not yet emitted to callback / accumulated_text
     int tokens_generated = 0;
+
+    // Emit a substring to the streaming callback and the accumulated text in
+    // one place so the cleanup paths stay consistent. Returns Stop if the
+    // caller asked us to cancel.
+    auto emit = [&](const std::string& s) -> CallbackResult {
+        if (s.empty()) return CallbackResult::Continue;
+        accumulated_text += s;
+        return on_token(s);
+    };
 
     while (tokens_generated < params.max_tokens) {
         if (impl_->cancel_flag.load(std::memory_order_relaxed)) {
@@ -183,24 +260,53 @@ GenerationResult BitnetEngine::generate(
 
         std::string piece = common_token_to_piece(impl_->ctx, id, /*special*/ false);
 
-        // Stop-sequence match runs against the cumulative output so that
-        // sequences spanning multiple tokens still trigger.
-        bool hit_stop = false;
+        // Combine the previously held tail with the new piece, then look for
+        // any stop sequence in the combined buffer. The earliest match (lowest
+        // position) wins, so multi-stop callers get deterministic truncation.
+        std::string combined = held + piece;
+        size_t stop_pos = std::string::npos;
         for (const auto& stop : params.stop_sequences) {
-            if (!stop.empty() && accumulated_text.find(stop) != std::string::npos) {
-                hit_stop = true;
-                break;
-            }
+            if (stop.empty()) continue;
+            size_t p = combined.find(stop);
+            if (p != std::string::npos && p < stop_pos) stop_pos = p;
         }
-        if (hit_stop) {
+
+        if (stop_pos != std::string::npos) {
+            // Emit only what comes before the matched stop, then quit. The
+            // matched stop sequence and any trailing content from this piece
+            // are trimmed (OpenAI behavior).
+            //
+            // The pre-stop prefix is by construction part of the model's
+            // already-emitted text, so it ends at a UTF-8 char boundary if all
+            // prior flushes did — which they do, by induction.
+            emit(combined.substr(0, stop_pos));
+            held.clear();
             result.finish_reason = FinishReason::StopSequence;
             break;
         }
 
-        accumulated_text += piece;
-        if (on_token(piece) == CallbackResult::Stop) {
-            result.finish_reason = FinishReason::Cancelled;
-            break;
+        // No stop yet. Flush everything except the last `holdback` bytes,
+        // backed off to the nearest UTF-8 character boundary so we never emit
+        // a truncated multi-byte codepoint.
+        if (combined.size() > holdback) {
+            const size_t target = combined.size() - holdback;
+            const size_t flush_len = utf8_safe_prefix_len(combined, target);
+            if (flush_len > 0) {
+                if (emit(combined.substr(0, flush_len)) == CallbackResult::Stop) {
+                    // User cancelled mid-flush. Don't emit further; leave held
+                    // as the unflushed remainder for diagnostic completeness.
+                    held = combined.substr(flush_len);
+                    result.finish_reason = FinishReason::Cancelled;
+                    break;
+                }
+                held = combined.substr(flush_len);
+            } else {
+                // utf8_safe_prefix_len could only return 0 if the entire
+                // target prefix is continuation bytes — rare, but defensible.
+                held = std::move(combined);
+            }
+        } else {
+            held = std::move(combined);
         }
 
         // Feed the sampled token back so the next sample sees fresh logits.
@@ -211,6 +317,22 @@ GenerationResult BitnetEngine::generate(
         }
         n_past++;
         tokens_generated++;
+    }
+
+    // Flush any remaining held suffix on the natural-completion paths (EOS,
+    // length). For Cancelled we skip — the caller explicitly asked us to stop
+    // emitting, so don't squeeze out one last chunk. For StopSequence `held`
+    // was cleared above. In either skipped case the held bytes do NOT appear
+    // in accumulated_text, matching the contract that emit() is the single
+    // source of truth for the returned text.
+    if ((result.finish_reason == FinishReason::EndOfSequence ||
+         result.finish_reason == FinishReason::Length) && !held.empty()) {
+        // Drop any trailing incomplete UTF-8 sequence. If the model stopped
+        // mid-codepoint, those bytes can never complete — emitting them would
+        // crash NewStringUTF and they wouldn't render anyway.
+        const size_t safe_end = utf8_safe_prefix_len(held, held.size());
+        if (safe_end > 0) emit(held.substr(0, safe_end));
+        held.clear();
     }
 
     result.text             = std::move(accumulated_text);

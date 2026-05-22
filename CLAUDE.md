@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A React Native TurboModule wrapping `bitnet.cpp` / `llama.cpp` for on-device inference of BitNet GGUF models. Scaffolded with `create-react-native-library` (turbo-module, kotlin-objc). The Android implementation is the real one; iOS is still the scaffold stub (`Bitnet.mm` has the original `multiply` method, not yet ported to the engine).
+A React Native TurboModule wrapping `bitnet.cpp` / `llama.cpp` for on-device inference of BitNet GGUF models. Scaffolded with `create-react-native-library` (turbo-module, kotlin-objc). The Android implementation is the real one; on iOS the model lifecycle (download / cache / list / delete) is wired but the inference engine methods (`loadModel`, `generate`, `applyChatTemplate`, `getModelInfo`) still reject with `E_NOT_IMPLEMENTED` — see `ios/Bitnet.mm`.
 
 ## Repository layout
 
@@ -18,7 +18,7 @@ Yarn workspaces monorepo. The library is the root package; `example/` is a works
   - `src/main/cpp/include/{llama,common,ggml}` — vendored headers.
   - `src/main/jniLibs/arm64-v8a/` — prebuilt `libllama.so`, `libggml.so`, `libcommon.a`. **arm64 only** (see `abiFilters "arm64-v8a"` in `android/build.gradle` — ADR-001 referenced in comments).
   - `CMakeLists.txt` — `bitnet_rn` shared lib links the three prebuilts. `CXX_VISIBILITY_PRESET default` is intentional: NDK's default-hidden visibility strips `JNIEXPORT` symbols from the dynamic table, breaking `dlsym()` resolution.
-- `ios/` — stub only. `Bitnet.mm` still has the scaffold `multiply` method; needs real engine wiring before iOS will work.
+- `ios/` — `Bitnet.mm` has the model-lifecycle methods wired (delegating to `BitnetDownloader`/`BitnetCache`), but the inference engine methods are still `E_NOT_IMPLEMENTED` stubs. The C++ engine in `android/src/main/cpp/bitnet_engine.{h,cpp}` is intentionally platform-agnostic and can be reused unchanged when the iOS port lands.
 - `example/` — RN host app. `example/src/App.tsx` loads a model from `/data/data/bitnet.example/files/model.gguf` and logs streaming tokens to an on-screen ScrollView (also `console.log`'d to logcat).
 
 ## Commands

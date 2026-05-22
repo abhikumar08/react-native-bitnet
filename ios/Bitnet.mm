@@ -72,14 +72,19 @@ RCT_EXPORT_MODULE()
 }
 
 - (void)generate:(double)handle
-          prompt:(NSString *)prompt
-       maxTokens:(double)maxTokens
-     temperature:(double)temperature
-            topK:(double)topK
-            topP:(double)topP
-            seed:(double)seed
-         resolve:(RCTPromiseResolveBlock)resolve
-          reject:(RCTPromiseRejectBlock)reject {
+                prompt:(NSString *)prompt
+             maxTokens:(double)maxTokens
+           temperature:(double)temperature
+                  topK:(double)topK
+                  topP:(double)topP
+                  seed:(double)seed
+     stopSequencesJson:(NSString *)stopSequencesJson
+         repeatPenalty:(double)repeatPenalty
+           repeatLastN:(double)repeatLastN
+      frequencyPenalty:(double)frequencyPenalty
+       presencePenalty:(double)presencePenalty
+               resolve:(RCTPromiseResolveBlock)resolve
+                reject:(RCTPromiseRejectBlock)reject {
   reject(@"E_NOT_IMPLEMENTED", @"iOS engine not yet wired", nil);
 }
 

@@ -78,6 +78,12 @@ function AppContent() {
   const [input, setInput] = useState('');
   const [system, setSystem] = useState(DEFAULT_SYSTEM);
   const [showSystem, setShowSystem] = useState(false);
+  // Comma-separated stop sequences. Defaults stop the BitNet b1.58 chat
+  // template on the next turn's role header so the assistant doesn't leak
+  // into a fake user turn. Escapes (\n, \t, etc.) are honored.
+  const [stopText, setStopText] = useState<string>('<|start_header_id|>');
+  const [repeatPenaltyText, setRepeatPenaltyText] = useState<string>('1.15');
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [streaming, setStreaming] = useState(false);
 
   const engineRef = useRef<Engine | null>(null);
@@ -200,10 +206,17 @@ function AppContent() {
         [{ role: 'system', content: system }, ...history, userMsg],
         true
       );
+      const stopList = stopText
+        .split(',')
+        .map((s) => s.replace(/\\n/g, '\n').replace(/\\t/g, '\t').trim())
+        .filter((s) => s.length > 0);
+      const repeatPenalty = Number.parseFloat(repeatPenaltyText);
       await engine.generate(prompt, {
         maxTokens: 256,
         temperature: 0.8,
         seed: 0,
+        stop: stopList,
+        repeatPenalty: Number.isFinite(repeatPenalty) ? repeatPenalty : 1.1,
         onToken: appendToLastAssistant,
       });
     } catch (e: unknown) {
@@ -219,7 +232,15 @@ function AppContent() {
     } finally {
       if (mountedRef.current) setStreaming(false);
     }
-  }, [appendToLastAssistant, input, loadState, streaming, system]);
+  }, [
+    appendToLastAssistant,
+    input,
+    loadState,
+    streaming,
+    system,
+    stopText,
+    repeatPenaltyText,
+  ]);
 
   const stop = useCallback(() => {
     const engine = engineRef.current;
@@ -265,6 +286,14 @@ function AppContent() {
             </Text>
           </Pressable>
           <Pressable
+            onPress={() => setShowAdvanced((v) => !v)}
+            style={styles.headerBtn}
+          >
+            <Text style={styles.headerBtnText}>
+              {showAdvanced ? 'Hide advanced' : 'Advanced'}
+            </Text>
+          </Pressable>
+          <Pressable
             onPress={reset}
             disabled={streaming}
             style={[styles.headerBtn, streaming && styles.disabled]}
@@ -284,6 +313,34 @@ function AppContent() {
             onEndEditing={(e) => setSystem(e.nativeEvent.text)}
             placeholder="You are a helpful assistant."
             placeholderTextColor="#666"
+          />
+        </View>
+      )}
+
+      {showAdvanced && (
+        <View style={styles.systemBlock}>
+          <Text style={styles.systemLabel}>
+            Stop sequences (comma-separated, \n for newline)
+          </Text>
+          <TextInput
+            style={styles.advancedInput}
+            defaultValue={stopText}
+            onEndEditing={(e) => setStopText(e.nativeEvent.text)}
+            placeholder="<|start_header_id|>, \nUser:"
+            placeholderTextColor="#666"
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+          <Text style={[styles.systemLabel, styles.advancedLabelGap]}>
+            Repeat penalty (1.0 = off, 1.1 default)
+          </Text>
+          <TextInput
+            style={styles.advancedInput}
+            defaultValue={repeatPenaltyText}
+            onEndEditing={(e) => setRepeatPenaltyText(e.nativeEvent.text)}
+            placeholder="1.15"
+            placeholderTextColor="#666"
+            keyboardType="decimal-pad"
           />
         </View>
       )}
@@ -446,6 +503,15 @@ const styles = StyleSheet.create({
     minHeight: 60,
     textAlignVertical: 'top',
   },
+  advancedInput: {
+    color: '#fff',
+    backgroundColor: '#151515',
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    fontSize: 13,
+  },
+  advancedLabelGap: { marginTop: 8 },
   banner: {
     flexDirection: 'row',
     alignItems: 'center',
