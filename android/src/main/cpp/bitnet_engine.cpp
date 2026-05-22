@@ -295,9 +295,9 @@ GenerationResult BitnetEngine::generate(
             const size_t flush_len = utf8_safe_prefix_len(combined, target);
             if (flush_len > 0) {
                 if (emit(combined.substr(0, flush_len)) == CallbackResult::Stop) {
-                    // User cancelled mid-flush. Don't emit further; leave held
-                    // as the unflushed remainder for diagnostic completeness.
-                    held = combined.substr(flush_len);
+                    // User cancelled mid-flush. No need to update `held` —
+                    // it isn't observed past the break (the cleanup path
+                    // intentionally skips flushing on Cancelled).
                     result.finish_reason = FinishReason::Cancelled;
                     break;
                 }
@@ -374,7 +374,7 @@ std::string BitnetEngine::apply_chat_template(
         // value here — `llama_chat_apply_template(model, nullptr, ...)` will
         // fetch and apply it below. The probe exists purely to give callers
         // a clear, typed error when the key is absent rather than letting
-        // llama.cpp fall back to its built-in "Sytem:/User:/Assistant:"
+        // llama.cpp fall back to its built-in "System:/User:/Assistant:"
         // approximation, which is OOD for every real model.
         char probe[1];
         const int32_t n = llama_model_meta_val_str(
