@@ -52,6 +52,50 @@ type LoadState =
   | { phase: 'ready' }
   | { phase: 'error'; message: string };
 
+// Manual renderer for microsoft/bitnet-b1.58-2B-4T-gguf's training format.
+// The GGUF does ship a tokenizer.chat_template, but it's a custom Jinja
+// string that llama.cpp's pattern-matcher doesn't recognize, so
+// applyChatTemplate produces a broken approximation. The template's actual
+// shape, decoded from the model's metadata, is:
+//
+//   {bos_token}Human: {user}\n\nBITNETAssistant: {assistant}{eos_token}...
+//
+// (Literally "BITNETAssistant" — not "Assistant". This is what the model
+// was trained on; deviating produces gibberish.) The template has no system
+// role; we prepend system content to the first user turn so it still
+// reaches the context window.
+function renderBitnetPrompt(messages: ChatMessage[]): string {
+  const BOS = '<s>'; // bos_token for the model's Llama tokenizer
+  let out = BOS;
+  let pendingSystem = '';
+  let lastWasUser = false;
+  for (const m of messages) {
+    if (m.role === 'system') {
+      pendingSystem += m.content + '\n\n';
+    } else if (m.role === 'user') {
+      const content = pendingSystem
+        ? `${pendingSystem}${m.content}`
+        : m.content;
+      out += `Human: ${content}\n\nBITNETAssistant: `;
+      pendingSystem = '';
+      lastWasUser = true;
+    } else if (m.role === 'assistant') {
+      // No eos here — keeps the trailing prompt open for the model to
+      // continue from "BITNETAssistant: " on the next turn.
+      out += m.content;
+      lastWasUser = false;
+    }
+  }
+  // If the conversation ends on an assistant turn (e.g. regenerating), the
+  // upstream template appends another "Human:" prefix; we mirror that by
+  // ending on an open prompt only when we just appended a user turn. When
+  // we just appended an assistant turn (replay case), open a fresh turn.
+  if (!lastWasUser) {
+    out += '\n\nHuman: \n\nBITNETAssistant: ';
+  }
+  return out;
+}
+
 export function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -208,10 +252,20 @@ function AppContent() {
     cancelRequestedRef.current = false;
 
     try {
-      const prompt = await engine.applyChatTemplate(
-        [{ role: 'system', content: system }, ...history, userMsg],
-        true
-      );
+      const turns: ChatMessage[] = [
+        { role: 'system', content: system },
+        ...history,
+        userMsg,
+      ];
+      // BitNet b1.58 2B-4T ships a custom chat template in its GGUF metadata,
+      // but llama.cpp's pattern-matcher can't recognize the Jinja format and
+      // produces a broken approximation that the model interprets as OOD —
+      // generation degenerates to '@@@@@…'. We render the model's actual
+      // training format manually instead. See renderBitnetPrompt above for
+      // the full explanation. engine.applyChatTemplate() remains useful for
+      // models whose templates llama.cpp DOES recognize (chatml, llama3,
+      // mistral, etc.) — switch to that branch when loading those models.
+      const prompt = renderBitnetPrompt(turns);
       const stopList = stopText
         .split(',')
         .map((s) => s.replace(/\\n/g, '\n').replace(/\\t/g, '\t').trim())

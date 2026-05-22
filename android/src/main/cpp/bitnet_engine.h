@@ -258,8 +258,21 @@ public:
     ModelInfo model_info() const;
 
     /// Render a list of chat messages into the prompt string format the model
-    /// was trained on. Uses the model's built-in chat template from GGUF metadata.
-    /// Throws std::runtime_error if the model has no usable template.
+    /// was trained on. Delegates to `llama_chat_apply_template`, which reads
+    /// the model's `tokenizer.chat_template` GGUF metadata key and pattern-
+    /// matches it against llama.cpp's built-in list (chatml, llama2, llama3,
+    /// mistral, gemma, qwen, etc.).
+    ///
+    /// Throws std::runtime_error if:
+    ///   (a) the model has no `tokenizer.chat_template` metadata key, or
+    ///   (b) the template is present but llama.cpp doesn't recognize it.
+    ///
+    /// We deliberately do NOT fall back to a hardcoded format here. The
+    /// previous implementation did (Llama-3 markup), which silently produced
+    /// OOD prompts on non-Llama-3 models. llama.cpp's own internal fallback
+    /// is even worse — a "System:/User:/Assistant:" Frankenstein mixed with
+    /// stray `<|eot_id|>` tokens. Throwing forces the caller to either pick
+    /// a model with a real template or render the prompt manually.
     std::string apply_chat_template(
         const std::vector<ChatMessage>& messages,
         bool add_assistant_header = true) const;

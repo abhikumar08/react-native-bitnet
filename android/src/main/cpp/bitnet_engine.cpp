@@ -363,17 +363,80 @@ std::string BitnetEngine::apply_chat_template(
     const std::vector<ChatMessage>& messages,
     bool add_assistant_header) const
 {
-    std::string result;
-    result += "<|begin_of_text|>";
+    // Require the model to ship a chat template in its GGUF metadata. llama.cpp
+    // will silently fall back to a bizarre default ("System: …User: …<|eot_id|>
+    // Assistant:") for models without one, which is OOD for every real model
+    // and produces gibberish output. Surfacing a clear error instead lets the
+    // caller decide: format the prompt manually and use engine.generate() with
+    // the raw string, or load a different model.
+    {
+        // Probe for the chat template metadata up front. We don't read the
+        // value here — `llama_chat_apply_template(model, nullptr, ...)` will
+        // fetch and apply it below. The probe exists purely to give callers
+        // a clear, typed error when the key is absent rather than letting
+        // llama.cpp fall back to its built-in "Sytem:/User:/Assistant:"
+        // approximation, which is OOD for every real model.
+        char probe[1];
+        const int32_t n = llama_model_meta_val_str(
+            impl_->model, "tokenizer.chat_template", probe, sizeof(probe));
+        if (n <= 0) {
+            throw std::runtime_error(
+                "Model has no `tokenizer.chat_template` GGUF metadata. "
+                "Render the prompt manually and pass it to engine.generate() "
+                "instead of using applyChatTemplate.");
+        }
+    }
+
+    // Build llama.cpp's view of the chat. Pointers reference the caller's
+    // ChatMessage strings — safe because we don't mutate `messages` here and
+    // llama_chat_apply_template only reads them synchronously.
+    std::vector<llama_chat_message> msgs;
+    msgs.reserve(messages.size());
     for (const auto& m : messages) {
-        result += "<|start_header_id|>" + m.role + "<|end_header_id|>\n\n";
-        result += m.content;
-        result += "<|eot_id|>";
+        msgs.push_back({m.role.c_str(), m.content.c_str()});
     }
-    if (add_assistant_header) {
-        result += "<|start_header_id|>assistant<|end_header_id|>\n\n";
+
+    // Initial buffer sizing follows the upstream recommendation (2x total
+    // chars) with a floor for very short chats. If it's too small we resize
+    // and retry exactly once — llama_chat_apply_template returns the bytes
+    // it would have written, so the second pass is guaranteed to fit.
+    size_t total_chars = 0;
+    for (const auto& m : messages) {
+        total_chars += m.role.size() + m.content.size();
     }
-    return result;
+    std::vector<char> buf(std::max<size_t>(total_chars * 2, 4096));
+
+    // tmpl=nullptr → use the model's GGUF metadata template (which we just
+    // verified exists). llama.cpp pattern-matches the Jinja string against
+    // its built-in list of recognized templates (chatml, llama2, llama3,
+    // mistral, gemma, qwen, etc.) and renders accordingly.
+    int32_t needed = llama_chat_apply_template(
+        impl_->model, /*tmpl=*/nullptr,
+        msgs.data(), msgs.size(),
+        add_assistant_header,
+        buf.data(), static_cast<int32_t>(buf.size()));
+
+    if (needed < 0) {
+        throw std::runtime_error(
+            "llama_chat_apply_template failed — model's chat template is "
+            "present in metadata but does not match any format llama.cpp "
+            "recognizes. Render the prompt manually instead.");
+    }
+
+    if (static_cast<size_t>(needed) > buf.size()) {
+        buf.resize(static_cast<size_t>(needed));
+        needed = llama_chat_apply_template(
+            impl_->model, nullptr,
+            msgs.data(), msgs.size(),
+            add_assistant_header,
+            buf.data(), static_cast<int32_t>(buf.size()));
+        if (needed < 0) {
+            throw std::runtime_error(
+                "llama_chat_apply_template failed on retry after buffer resize");
+        }
+    }
+
+    return std::string(buf.data(), static_cast<size_t>(needed));
 }
 
 }  // namespace bitnet
