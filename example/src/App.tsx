@@ -26,6 +26,7 @@ import {
   Models,
   type ChatMessage,
   type DownloadProgress,
+  type GenerationResult,
   type ModelRef,
 } from 'react-native-bitnet';
 import { ModelsPanel } from './ModelsPanel';
@@ -85,6 +86,10 @@ function AppContent() {
   const [repeatPenaltyText, setRepeatPenaltyText] = useState<string>('1.15');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [streaming, setStreaming] = useState(false);
+  // Last completed generation's metadata — rendered as a one-liner under
+  // the most recent assistant bubble so the new structured-result fields
+  // are visible on every chat turn.
+  const [lastResult, setLastResult] = useState<GenerationResult | null>(null);
 
   const engineRef = useRef<Engine | null>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
@@ -199,6 +204,7 @@ function AppContent() {
     setMessages([...history, userMsg, placeholder]);
     setInput('');
     setStreaming(true);
+    setLastResult(null);
     cancelRequestedRef.current = false;
 
     try {
@@ -211,7 +217,7 @@ function AppContent() {
         .map((s) => s.replace(/\\n/g, '\n').replace(/\\t/g, '\t').trim())
         .filter((s) => s.length > 0);
       const repeatPenalty = Number.parseFloat(repeatPenaltyText);
-      await engine.generate(prompt, {
+      const result = await engine.generate(prompt, {
         maxTokens: 256,
         temperature: 0.8,
         seed: 0,
@@ -219,6 +225,8 @@ function AppContent() {
         repeatPenalty: Number.isFinite(repeatPenalty) ? repeatPenalty : 1.1,
         onToken: appendToLastAssistant,
       });
+      if (mountedRef.current) setLastResult(result);
+      console.log('[generate]', JSON.stringify(result));
     } catch (e: unknown) {
       if (!cancelRequestedRef.current && mountedRef.current) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -257,7 +265,14 @@ function AppContent() {
     if (streaming) return;
     Alert.alert('Reset chat?', 'This clears the conversation transcript.', [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Reset', style: 'destructive', onPress: () => setMessages([]) },
+      {
+        text: 'Reset',
+        style: 'destructive',
+        onPress: () => {
+          setMessages([]);
+          setLastResult(null);
+        },
+      },
     ]);
   }, [streaming]);
 
@@ -397,6 +412,8 @@ function AppContent() {
               const isLast = i === messages.length - 1;
               const showSpinner =
                 !isUser && isLast && streaming && m.content.length === 0;
+              const showStats =
+                !isUser && isLast && !streaming && lastResult !== null;
               return (
                 <View
                   key={i}
@@ -409,6 +426,21 @@ function AppContent() {
                     <ActivityIndicator color="#bbb" />
                   ) : (
                     <Text style={styles.bubbleText}>{m.content}</Text>
+                  )}
+                  {showStats && lastResult && (
+                    <Text style={styles.stats}>
+                      {lastResult.finishReason} ·{' '}
+                      {lastResult.usage.completionTokens}/
+                      {lastResult.usage.totalTokens} tok ·{' '}
+                      {lastResult.wallTimeMs} ms
+                      {lastResult.wallTimeMs > 0
+                        ? ` (${(
+                            (lastResult.usage.completionTokens /
+                              lastResult.wallTimeMs) *
+                            1000
+                          ).toFixed(1)} tok/s)`
+                        : ''}
+                    </Text>
                   )}
                 </View>
               );
@@ -540,6 +572,12 @@ const styles = StyleSheet.create({
     backgroundColor: '#222',
   },
   bubbleText: { color: '#f0f0f0', fontSize: 14, lineHeight: 19 },
+  stats: {
+    color: '#888',
+    fontSize: 10,
+    marginTop: 6,
+    fontVariant: ['tabular-nums'],
+  },
   footer: {
     flexDirection: 'row',
     alignItems: 'center',

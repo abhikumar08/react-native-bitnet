@@ -25,6 +25,27 @@ export type ChatMessage = {
   content: string;
 };
 
+// Why generation ended. Mirrors OpenAI's `finish_reason` plus an on-device
+// 'cancelled' for the case where the caller invoked engine.cancel(). Both
+// EOS (the model emitting its end-of-sequence token) and a stop-sequence
+// match collapse to 'stop' to match OpenAI semantics.
+export type FinishReason = 'length' | 'stop' | 'cancelled';
+
+export type TokenUsage = {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+};
+
+export type GenerationResult = {
+  // The full generated text, with any matched stop sequence trimmed.
+  text: string;
+  finishReason: FinishReason;
+  usage: TokenUsage;
+  // Wall-clock time the engine spent in this generate() call, in ms.
+  wallTimeMs: number;
+};
+
 export type GenerationParams = {
   maxTokens?: number;
   temperature?: number;
@@ -105,7 +126,7 @@ export class Engine {
   async generate(
     prompt: string,
     params: GenerationParams = {}
-  ): Promise<string> {
+  ): Promise<GenerationResult> {
     this.throwIfDisposed();
 
     let subscription: { remove: () => void } | undefined;
@@ -120,7 +141,10 @@ export class Engine {
       typeof params.stop === 'string' ? [params.stop] : (params.stop ?? []);
 
     try {
-      return await NativeBitnet.generate(
+      // Cast narrows the spec-layer `finishReason: string` to our
+      // FinishReason union. The native side only ever resolves with one of
+      // those three values.
+      const raw = await NativeBitnet.generate(
         this.handle,
         prompt,
         params.maxTokens ?? 256,
@@ -134,6 +158,7 @@ export class Engine {
         params.frequencyPenalty ?? 0.0,
         params.presencePenalty ?? 0.0
       );
+      return raw as GenerationResult;
     } finally {
       subscription?.remove();
     }

@@ -11,10 +11,13 @@ export interface Spec extends TurboModule {
 
   disposeEngine(handle: number): void;
 
-  // One-shot generation (the streaming version uses events; see below)
+  // One-shot generation (the streaming version uses events; see below).
   // stopSequencesJson is a JSON-encoded array of strings — codegen doesn't
   // reliably marshal arrays at the param boundary in this RN version, so we
   // stringify on the JS side (same pattern as applyChatTemplate's rolesJson).
+  // finishReason is typed as `string` here because codegen string-literal
+  // unions are flaky on older RN; the public Engine.generate() narrows to
+  // 'length' | 'stop' | 'cancelled'.
   generate(
     handle: number,
     prompt: string,
@@ -28,7 +31,16 @@ export interface Spec extends TurboModule {
     repeatLastN: number,
     frequencyPenalty: number,
     presencePenalty: number
-  ): Promise<string>;
+  ): Promise<{
+    text: string;
+    finishReason: string;
+    usage: {
+      promptTokens: number;
+      completionTokens: number;
+      totalTokens: number;
+    };
+    wallTimeMs: number;
+  }>;
 
   cancelGeneration(handle: number): void;
 

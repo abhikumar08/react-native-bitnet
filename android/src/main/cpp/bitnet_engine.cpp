@@ -180,6 +180,8 @@ GenerationResult BitnetEngine::generate(
         throw std::runtime_error("prompt tokenized to zero tokens");
     }
 
+    result.prompt_tokens = static_cast<int>(prompt_tokens.size());
+
     // Prompt prefill in chunks of n_batch.
     const int n_batch = impl_->base_params.n_batch;
     int n_past = 0;

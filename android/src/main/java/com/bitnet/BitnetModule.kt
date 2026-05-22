@@ -97,14 +97,31 @@ class BitnetModule(private val reactContext: ReactApplicationContext) :
     // Run on a background thread so we don't block the JS thread for tens of seconds.
     Thread {
       try {
-        val text = nativeGenerate(
+        val json = nativeGenerate(
           handle.toLong(), prompt,
           maxTokens.toInt(), temperature.toFloat(),
           topK.toInt(), topP.toFloat(), seed.toInt(),
           stopSequencesJson,
           repeatPenalty.toFloat(), repeatLastN.toInt(),
           frequencyPenalty.toFloat(), presencePenalty.toFloat())
-        promise.resolve(text)
+        val parsed = org.json.JSONObject(json)
+        val promptTokens = parsed.getInt("promptTokens")
+        val completionTokens = parsed.getInt("completionTokens")
+        // OpenAI-style usage object. totalTokens is derived here rather than
+        // in C++ so the JSON stays tight and the derivation lives next to its
+        // consumer.
+        val usage = WritableNativeMap().apply {
+          putDouble("promptTokens", promptTokens.toDouble())
+          putDouble("completionTokens", completionTokens.toDouble())
+          putDouble("totalTokens", (promptTokens + completionTokens).toDouble())
+        }
+        val result = WritableNativeMap().apply {
+          putString("text", parsed.getString("text"))
+          putString("finishReason", parsed.getString("finishReason"))
+          putMap("usage", usage)
+          putDouble("wallTimeMs", parsed.getLong("wallTimeMs").toDouble())
+        }
+        promise.resolve(result)
       } catch (t: Throwable) {
         promise.reject("E_GEN_FAILED", t.message ?: "generate threw", t)
       }

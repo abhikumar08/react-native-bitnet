@@ -48,19 +48,23 @@ async function run() {
 	// });
 
 	try {
-		const text = await engine.generate('Hello, my name is', {
-			maxTokens: 64,
-			temperature: 0.8,
-			topK: 40,
-			topP: 0.95,
-			seed: 42,
-			onToken: (token) => {
-				// Streaming token callback
-				console.log(token);
-			},
-		});
+		const { text, finishReason, usage, wallTimeMs } = await engine.generate(
+			'Hello, my name is',
+			{
+				maxTokens: 64,
+				temperature: 0.8,
+				topK: 40,
+				topP: 0.95,
+				seed: 42,
+				onToken: (token) => {
+					// Streaming token callback
+					console.log(token);
+				},
+			}
+		);
 
 		console.log('Final output:', text);
+		console.log(`Stopped: ${finishReason} after ${usage.completionTokens} tokens in ${wallTimeMs} ms`);
 	} finally {
 		engine.dispose();
 	}
@@ -109,21 +113,26 @@ const engine = await Engine.load({
 
 ### 3. Generate text (with optional streaming)
 
-`engine.generate(prompt, params)` returns the final generated string.
-
-If you pass `onToken`, partial tokens are streamed as they arrive.
+`engine.generate(prompt, params)` resolves with a `GenerationResult` — the final text plus usage and finish-reason metadata. If you pass `onToken`, partial tokens are streamed as they arrive.
 
 ```ts
-const output = await engine.generate(prompt, {
+const { text, finishReason, usage, wallTimeMs } = await engine.generate(prompt, {
 	maxTokens: 256,
 	temperature: 0.8,
 	topK: 40,
 	topP: 0.95,
 	seed: 0,
+	stop: ['<|start_header_id|>'],   // OpenAI-style; string or string[]
+	repeatPenalty: 1.15,             // llama.cpp-style; 1.0 disables
+	frequencyPenalty: 0.0,           // OpenAI-style; additive
+	presencePenalty: 0.0,
 	onToken: (token) => {
 		// Append token to UI incrementally
 	},
 });
+
+// `finishReason` is 'length' | 'stop' | 'cancelled'.
+// `usage` is { promptTokens, completionTokens, totalTokens }.
 ```
 
 ### 4. Use chat templates (recommended for chat models)
@@ -139,7 +148,7 @@ const renderedPrompt = await engine.applyChatTemplate(
 	true
 );
 
-const answer = await engine.generate(renderedPrompt, {
+const { text: answer } = await engine.generate(renderedPrompt, {
 	maxTokens: 128,
 });
 ```
@@ -162,7 +171,10 @@ const pending = engine.generate(longPrompt, { onToken: console.log });
 // Later, based on user action:
 engine.cancel();
 
+// `pending` resolves (does NOT reject) with whatever was generated so far.
 const result = await pending;
+// result.finishReason === 'cancelled'
+// result.text contains the partial output up to the cancel point.
 engine.dispose();
 ```
 
@@ -181,9 +193,9 @@ Creates a native engine and loads the model.
 - `threads?: number` (default `4`)
 - `batchSize?: number` (default `512`)
 
-### `engine.generate(prompt: string, params?: GenerationParams): Promise<string>`
+### `engine.generate(prompt: string, params?: GenerationParams): Promise<GenerationResult>`
 
-Generates text from a prompt.
+Generates text from a prompt. Resolves with the final text plus metadata; if `engine.cancel()` was called mid-flight, resolves with the partial text and `finishReason: 'cancelled'` (never rejects on cancel).
 
 `GenerationParams`:
 
@@ -191,8 +203,20 @@ Generates text from a prompt.
 - `temperature?: number` (default `0.8`)
 - `topK?: number` (default `40`)
 - `topP?: number` (default `0.95`)
-- `seed?: number` (default `0`)
-- `onToken?: (token: string) => void` (optional streaming callback)
+- `seed?: number` (default `0` — engine treats `0` as "pick a fresh seed")
+- `stop?: string | string[]` — OpenAI-style stop sequence(s). The matched string is trimmed from the returned text and never emitted to `onToken`.
+- `repeatPenalty?: number` (default `1.1`, `1.0` disables) — llama.cpp-style multiplicative penalty against tokens seen in the last `repeatLastN` positions.
+- `repeatLastN?: number` (default `64`) — window used by `repeatPenalty`, `frequencyPenalty`, and `presencePenalty`.
+- `frequencyPenalty?: number` (default `0.0`) — OpenAI-style additive penalty proportional to recent frequency.
+- `presencePenalty?: number` (default `0.0`) — OpenAI-style additive penalty for any prior occurrence.
+- `onToken?: (token: string) => void` — optional streaming callback. Receives complete UTF-8 chunks only (the SDK buffers across token boundaries so multibyte characters never split).
+
+`GenerationResult`:
+
+- `text: string` — the full generated text, with any matched `stop` trimmed.
+- `finishReason: 'length' | 'stop' | 'cancelled'` — `'length'` = hit `maxTokens`; `'stop'` = model emitted EOS or a `stop` sequence matched; `'cancelled'` = caller invoked `engine.cancel()`.
+- `usage: { promptTokens, completionTokens, totalTokens }` — OpenAI-shaped token counts.
+- `wallTimeMs: number` — wall-clock time spent in this `generate()` call.
 
 ### `engine.cancel(): void`
 

@@ -152,6 +152,10 @@ struct GenerationResult {
     /// Why generation stopped.
     FinishReason finish_reason = FinishReason::Length;
 
+    /// Number of tokens consumed from the input prompt (after tokenization).
+    /// Surfaced to JS as `usage.promptTokens` for OpenAI-style accounting.
+    int prompt_tokens = 0;
+
     /// Number of tokens actually generated (does not count the prompt).
     int tokens_generated = 0;
 

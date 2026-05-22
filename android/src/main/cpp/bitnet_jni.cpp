@@ -68,6 +68,20 @@ std::string j2s(JNIEnv* env, jstring jstr) {
     return result;
 }
 
+// Map a C++ FinishReason to the JS string our public API exposes.
+// OpenAI parity: EndOfSequence and StopSequence both collapse to "stop".
+// "cancelled" and "error" are on-device-specific extensions.
+const char* finish_reason_to_string(bitnet::FinishReason r) {
+    switch (r) {
+        case bitnet::FinishReason::Length:        return "length";
+        case bitnet::FinishReason::EndOfSequence: return "stop";
+        case bitnet::FinishReason::StopSequence:  return "stop";
+        case bitnet::FinishReason::Cancelled:     return "cancelled";
+        case bitnet::FinishReason::Error:         return "error";
+    }
+    return "error";  // unreachable; keeps the compiler happy
+}
+
 // JSON-escape a single value (used for getModelInfo, which returns JSON).
 std::string json_escape(const std::string& s) {
     std::string out;
@@ -280,7 +294,20 @@ Java_com_bitnet_BitnetModule_nativeGenerate(
                 return bitnet::CallbackResult::Continue;
             });
 
-        return env->NewStringUTF(result.text.c_str());
+        // Encode the full GenerationResult as JSON. Kotlin parses it and
+        // resolves with a structured WritableNativeMap — same pattern as
+        // nativeGetModelInfo below. We avoid building a WritableMap directly
+        // here to keep this layer free of React Native types.
+        std::string json;
+        json.reserve(result.text.size() + 128);
+        json += "{";
+        json += "\"text\":\"";        json += json_escape(result.text);                           json += "\",";
+        json += "\"finishReason\":\""; json += finish_reason_to_string(result.finish_reason);     json += "\",";
+        json += "\"promptTokens\":";   json += std::to_string(result.prompt_tokens);              json += ",";
+        json += "\"completionTokens\":"; json += std::to_string(result.tokens_generated);         json += ",";
+        json += "\"wallTimeMs\":";     json += std::to_string(result.wall_time_ms);
+        json += "}";
+        return env->NewStringUTF(json.c_str());
 
     } catch (const std::exception& e) {
         jclass exc = env->FindClass("java/lang/RuntimeException");

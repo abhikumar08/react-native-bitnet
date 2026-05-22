@@ -44,7 +44,7 @@ The crucial design property visible in this phase: **the downcall and the upcall
 
 ## Phase 3 — EOS reached
 
-When `llama_decode` returns the model's end-of-sequence token (or the configured `max_tokens` is hit), the loop exits. The engine returns final statistics — total tokens generated, tokens per second — to JNI. JNI builds a `WritableMap` and returns it to Kotlin. Kotlin's deferred Promise resolves. The TS layer's `await` unblocks.
+When the decode loop hits the model's end-of-sequence token, a configured stop sequence, the `max_tokens` cap, or a cancel signal, it exits. The engine fills in a `GenerationResult` — the accumulated text, a `finish_reason`, the prompt-token count, the completion-token count, and the wall-clock time — and returns it to JNI. JNI serializes that struct to JSON; Kotlin parses it, builds a nested `WritableMap` (with a `usage` sub-map for OpenAI parity), and resolves the deferred Promise. The TS layer's `await` unblocks with a `GenerationResult` of shape `{ text, finishReason: 'length' | 'stop' | 'cancelled', usage: { promptTokens, completionTokens, totalTokens }, wallTimeMs }`. Tokens-per-second is not part of the result struct itself; it's a one-line JS-side derivation (`usage.completionTokens / (wallTimeMs / 1000)`) when callers want it.
 
 In the TS layer's `.finally()` handler, the `BitnetToken` listener registered in Phase 2 is removed. This matters: without it, a second `generate()` call would fire its events into both the new listener *and* the old one, causing every token to appear in the UI twice.
 
@@ -54,7 +54,7 @@ The Chat UI's `await engine.generate(...)` finally returns. It typically uses th
 
 A few details that are present in the code but not in the diagram:
 
-- **Cancellation.** `engine.cancel()` flips an `std::atomic<bool>` on the engine that the decode loop checks each iteration. The engine returns early; the upward stream of token events stops; the promise resolves with a `cancelled` flag set in the stats.
+- **Cancellation.** `engine.cancel()` flips an `std::atomic<bool>` on the engine that the decode loop checks each iteration. The engine returns early; the upward stream of token events stops; the promise resolves (does not reject) with `finishReason: 'cancelled'` and `text` containing whatever was generated before the cancel.
 - **Backpressure.** None. The C++ callback fires synchronously on the worker thread, blocking it until the JNI call completes. The JS event loop is not consulted. On the rare devices where token generation could outpace the JS event loop's ability to process them, tokens queue up in the bridge.
 - **Threading on the JNI side.** `emitToken` uses `env->CallVoidMethod`, which requires the calling thread to be attached to the JVM. Since the callback fires on the worker thread that Kotlin spawned (and which Kotlin attached to the JVM before crossing the JNI boundary), the env pointer is valid. A different threading scheme — say, the engine spawning its own thread — would need explicit `AttachCurrentThread` / `DetachCurrentThread` calls.
 
