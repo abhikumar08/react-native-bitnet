@@ -69,3 +69,4 @@ To confirm the New Architecture is active, look for `"fabric":true,"concurrentRo
 - The library uses `react-native-builder-bob` (`module` ESM + `typescript` targets) — never hand-edit `lib/`.
 - Don't add `npm install`/`npm run` instructions; this repo is Yarn-only.
 - ADRs are referenced in code comments (e.g. "see ADR-001" in `android/build.gradle`) but the documents themselves aren't checked in here.
+- Detailed API reference is the canonical doc surface at `docs/api/` (one file per resource: `engine.md`, `chat-completions.md`, `models.md`, `types.md`, `errors.md`, `events.md`, `streaming.md`). Update it alongside any `src/index.tsx` or `src/models.ts` change — follow `.claude/skills/update-api-reference/SKILL.md` and hand off to `@doc-sync-auditor` for the cross-check.

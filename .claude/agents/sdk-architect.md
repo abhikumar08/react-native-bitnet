@@ -77,8 +77,13 @@ When given a request, emit a plan with these sections (skip any that don't apply
 - Hand-off: error-symmetry-auditor.
 
 ## Docs & example
-- README updates, CLAUDE.md updates, example/src/App.tsx UI exposure.
-- Hand-off: doc-sync-auditor.
+- **docs/api/** — for every public-surface change, update the matching resource page
+  (engine.md / chat-completions.md / models.md / types.md / errors.md / events.md / streaming.md).
+  Drive via the `update-api-reference` skill.
+- README quick-reference pointer (docs/api/README.md) — update only if a public method was added/removed.
+- CLAUDE.md updates if architecture or conventions shifted.
+- example/src/App.tsx UI exposure for new features.
+- Hand-off: update-api-reference (skill) for the docs/api/ edit, then doc-sync-auditor for the cross-check.
 
 ## Verification
 - yarn typecheck && yarn lint.

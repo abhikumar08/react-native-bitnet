@@ -282,127 +282,17 @@ engine.dispose();
 
 ## API reference
 
-### `Engine.load(config: EngineConfig): Promise<Engine>`
+The detailed, OpenAI-style API reference lives under **[docs/api/](./docs/api/README.md)**. One file per resource:
 
-Creates a native engine and loads the model.
+- **[docs/api/engine.md](./docs/api/engine.md)** — `Engine.load`, `generate`, `stream`, `cancel`, `applyChatTemplate`, `modelInfo`, `dispose`.
+- **[docs/api/chat-completions.md](./docs/api/chat-completions.md)** — `engine.chat.completions.create` (the OpenAI-shaped facade).
+- **[docs/api/models.md](./docs/api/models.md)** — `Models.download`, `list`, `cacheSize`, `delete`, `isCached`, `cacheDir`, `resumeAll`, `resolve`.
+- **[docs/api/types.md](./docs/api/types.md)** — every exported type.
+- **[docs/api/errors.md](./docs/api/errors.md)** — every `E_*` code and `AbortError`.
+- **[docs/api/events.md](./docs/api/events.md)** — raw `BitnetToken` / `BitnetDownloadProgress` event payloads.
+- **[docs/api/streaming.md](./docs/api/streaming.md)** — patterns for `onToken`, `stream()`, `chat.completions.create({ stream: true })`, cancel vs `AbortSignal`.
 
-`EngineConfig` — provide exactly one of `modelPath` or `modelRef`:
-
-- `modelPath?: string` — absolute path to a GGUF file on disk
-- `modelRef?: string` — `hf://owner/repo/file.gguf[@revision]` or `https://...` (SDK downloads + caches)
-- `downloadOptions?: DownloadOptions` — progress callback, abort signal, auth token (only used with `modelRef`)
-- `contextSize?: number` (default `2048`)
-- `threads?: number` (default `4`)
-- `batchSize?: number` (default `512`)
-
-### `engine.generate(prompt: string, params?: GenerationParams): Promise<GenerationResult>`
-
-Generates text from a prompt. Resolves with the final text plus metadata; if `engine.cancel()` was called mid-flight, resolves with the partial text and `finishReason: 'cancelled'` (never rejects on cancel).
-
-`GenerationParams`:
-
-- `maxTokens?: number` (default `256`)
-- `temperature?: number` (default `0.8`)
-- `topK?: number` (default `40`)
-- `topP?: number` (default `0.95`)
-- `seed?: number` (default `0` — engine treats `0` as "pick a fresh seed")
-- `stop?: string | string[]` — OpenAI-style stop sequence(s). The matched string is trimmed from the returned text and never emitted to `onToken`.
-- `repeatPenalty?: number` (default `1.1`, `1.0` disables) — llama.cpp-style multiplicative penalty against tokens seen in the last `repeatLastN` positions.
-- `repeatLastN?: number` (default `64`) — window used by `repeatPenalty`, `frequencyPenalty`, and `presencePenalty`.
-- `frequencyPenalty?: number` (default `0.0`) — OpenAI-style additive penalty proportional to recent frequency.
-- `presencePenalty?: number` (default `0.0`) — OpenAI-style additive penalty for any prior occurrence.
-- `signal?: AbortSignal` — optional. Aborting causes the Promise (and any `stream.result` / iterator) to reject with `AbortError`. Distinct from `engine.cancel()` (which resolves with `finishReason: 'cancelled'`).
-- `onToken?: (token: string) => void` — optional streaming callback. Receives complete UTF-8 chunks only (the SDK buffers across token boundaries so multibyte characters never split).
-
-`GenerationResult`:
-
-- `text: string` — the full generated text, with any matched `stop` trimmed.
-- `finishReason: 'length' | 'stop' | 'cancelled'` — `'length'` = hit `maxTokens`; `'stop'` = model emitted EOS or a `stop` sequence matched; `'cancelled'` = caller invoked `engine.cancel()`.
-- `usage: { promptTokens, completionTokens, totalTokens }` — OpenAI-shaped token counts.
-- `wallTimeMs: number` — wall-clock time spent in this `generate()` call.
-
-### `engine.stream(prompt: string, params?: GenerationParams): GenerationStream`
-
-Streaming generation as an async iterable. `GenerationParams` is the same as `engine.generate` minus `onToken` (the iterator IS the streaming surface).
-
-`GenerationStream` is `AsyncIterable<GenerationChunk> & { result: Promise<GenerationResult> }`:
-
-- Each yielded chunk has shape `{ delta: string }` — incremental text, never a partial multi-byte UTF-8 sequence.
-- `await stream.result` returns the same `GenerationResult` shape as `engine.generate`.
-- Breaking out of the loop (or calling `iterator.return()`) auto-invokes `engine.cancel()`. `.result` then resolves with `finishReason: 'cancelled'` and partial `text`.
-
-### `engine.chat.completions.create(params, options?)`
-
-OpenAI-shaped facade over `applyChatTemplate` + `generate`/`stream`. Params use this SDK's camelCase (`maxTokens`, `frequencyPenalty`, etc.); the result mirrors OpenAI's wire format with snake_case sub-fields, a `choices` array, and a `usage` object.
-
-The optional second argument `options` matches OpenAI's request-options shape:
-
-```ts
-type ChatCompletionRequestOptions = {
-	signal?: AbortSignal;
-};
-```
-
-```ts
-type ChatCompletionCreateParams = {
-	messages: ChatMessage[];
-	maxTokens?: number;
-	temperature?: number;
-	topK?: number;
-	topP?: number;
-	seed?: number;
-	stop?: string | string[];
-	repeatPenalty?: number;
-	repeatLastN?: number;
-	frequencyPenalty?: number;
-	presencePenalty?: number;
-	stream?: boolean;
-};
-```
-
-Without `stream`, resolves to `ChatCompletion` (`{ id, object: 'chat.completion', created, model, choices: [{ index, message: { role, content }, finish_reason }], usage: { prompt_tokens, completion_tokens, total_tokens } }`).
-
-With `stream: true`, resolves to an `AsyncIterable<ChatCompletionChunk>`. First chunk carries `delta.role: 'assistant'`; middle chunks carry only `delta.content`; the final chunk has an empty delta and `finish_reason` set.
-
-Caveats:
-
-- `'cancelled'` finish reasons from the underlying engine map to `'stop'` in the facade for OpenAI parity. Callers who need to distinguish cancellation should use the lower-level `engine.generate` / `engine.stream`.
-- Requires the loaded GGUF to ship a `tokenizer.chat_template` that llama.cpp recognizes (chatml, llama2, llama3, mistral, gemma, qwen, etc.). Models with no template or with a custom Jinja string the pattern-matcher can't decode will throw — render the prompt manually and use `engine.generate` instead.
-
-### `engine.cancel(): void`
-
-Cancels an in-flight generation. Idempotent — safe to call when nothing is in flight.
-
-### `engine.applyChatTemplate(messages: ChatMessage[], addAssistantHeader?: boolean): Promise<string>`
-
-Renders a chat prompt using model metadata template.
-
-`ChatMessage`:
-
-- `role: 'system' | 'user' | 'assistant'`
-- `content: string`
-
-### `engine.modelInfo(): Promise<ModelInfo>`
-
-Returns metadata:
-
-- `architecture: string`
-- `nVocab: number`
-- `nCtxTrain: number`
-- `nEmbd: number`
-- `modelSizeBytes: number`
-
-### `engine.dispose(): void`
-
-Releases native engine resources. Idempotent — calling twice is safe.
-
-### Error codes
-
-The SDK throws `Error` instances with a `.code` string property for typed conditions. Pattern-match on `.code` rather than the message:
-
-- `E_ENGINE_BUSY` — thrown by `generate` / `stream` / `chat.completions.create` when another generation is already in flight on the same `Engine`. Await the in-flight call or invoke `engine.cancel()` first.
-- `E_ENGINE_DISPOSED` — thrown by any `Engine` method (other than `dispose` itself) after `engine.dispose()` has been called. Load a fresh engine with `Engine.load()` to continue.
-- `AbortError` (`.name === 'AbortError'`, no `.code`) — thrown when an `AbortSignal` passed to `generate` / `stream` / `chat.completions.create` fires before completion. Web-standard shape; see the Aborting section above.
+Errors carry a `.code` property starting with `E_*` for typed pattern-matching (e.g. `E_ENGINE_BUSY`, `E_ENGINE_DISPOSED`). `AbortError` uses `name === 'AbortError'` (Web `AbortController` convention). See [docs/api/errors.md](./docs/api/errors.md) for the catalog.
 
 ## Model lifecycle
 
@@ -454,42 +344,17 @@ console.log('Resumed:', r.resumed.length, 'Failed:', r.failed.length);
 - `https://example.com/model.gguf` — any direct URL
 - `file:///absolute/path/to/model.gguf` — passthrough, no download (Engine loads from the path directly)
 
-### `CachedModelEntry` shape (returned by `Models.list` and `Models.download`)
+### Reference
 
-```ts
-{
-	modelRef: string;          // canonical ref
-	cacheKey: string;          // 16-char hex (sha256 prefix of modelRef)
-	localPath: string;         // model.gguf when complete; model.gguf.part when not
-	sizeBytes: number;         // re-stat'd from disk on each call
-	expectedSizeBytes: number; // server Content-Length, or -1 if unknown
-	complete: boolean;         // true => Engine.load({ modelPath: entry.localPath }) is ready to use
-	createdAt: number;         // epoch ms
-	completedAt: number;       // epoch ms, or 0 if !complete
-	sha256: string;            // computed if expectedSha256 was provided
-	etag: string;              // server etag, used internally for If-Range on resume
-	lastError?: string;        // only on incomplete entries: "E_NETWORK", "E_INTERRUPTED", etc.
-	resolvedUrl: string;       // the actual HTTPS URL fetched (after HF resolution)
-}
-```
+- [`CachedModelEntry`](./docs/api/types.md#cachedmodelentry) — shape returned by `Models.list` / `Models.download`.
+- [`DownloadOptions`](./docs/api/types.md#downloadoptions), [`ResumeAllOptions`](./docs/api/types.md#resumealloptions) — option types.
+- [Download / cache error codes](./docs/api/errors.md#download--cache-errors) — `E_INVALID_REF`, `E_NETWORK`, `E_HTTP_4XX`, `E_HTTP_5XX`, `E_DISK_FULL`, `E_CHECKSUM_MISMATCH`, etc.
 
 ### Resume semantics
 
 Resume is automatic and implicit when you call `Models.download(ref)` again — the SDK detects the `.part` file and sends a `Range`/`If-Range` request. If the server's ETag changed (file was updated), the download restarts cleanly.
 
 State survives app restart, force-stop, and OS kill. The on-disk `.part` file size IS the persisted progress count. After a process death, the next call to `Models.list()` shows the entry with `complete:false` and `lastError:"E_INTERRUPTED"`.
-
-### Error codes (thrown from `Models.download` / `Engine.load`)
-
-| Code | Meaning |
-|---|---|
-| `E_INVALID_REF` | Unparseable `modelRef` |
-| `E_NETWORK` | I/O failure |
-| `E_HTTP_4XX` | Server returned 4xx (401 includes a hint to set `authToken`) |
-| `E_HTTP_5XX` | Server returned 5xx — retryable |
-| `E_DISK_FULL` | Out of storage; `.part` is preserved for later resume |
-| `E_CHECKSUM_MISMATCH` | Provided `expectedSha256` didn't match — `.part` removed |
-| `E_DOWNLOAD_CANCELLED` | User cancel via `cancelDownload` or `AbortSignal` (re-thrown as `AbortError`) |
 
 ### Cache directory
 

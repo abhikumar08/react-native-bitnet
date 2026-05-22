@@ -32,7 +32,8 @@
           { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/nudge-typecheck.sh" },
           { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/nudge-lint.sh" },
           { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/nudge-verify-streaming.sh" },
-          { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/nudge-fanout-completion.sh" }
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/nudge-fanout-completion.sh" },
+          { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/nudge-api-doc-update.sh" }
         ]
       }
     ]
