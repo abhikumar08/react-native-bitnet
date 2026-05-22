@@ -1,5 +1,7 @@
 #import <BitnetSpec/BitnetSpec.h>
+#import <React/RCTEventEmitter.h>
+#import "BitnetDownloader.h"
 
-@interface Bitnet : NSObject <NativeBitnetSpec>
+@interface Bitnet : RCTEventEmitter <NativeBitnetSpec, BitnetDownloaderDelegate>
 
 @end

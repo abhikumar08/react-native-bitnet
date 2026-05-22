@@ -7,7 +7,7 @@ export interface Spec extends TurboModule {
     nCtx: number,
     nThreads: number,
     nBatch: number
-  ): Promise<number>;  // returns engine handle
+  ): Promise<number>; // returns engine handle
 
   disposeEngine(handle: number): void;
 
@@ -27,7 +27,7 @@ export interface Spec extends TurboModule {
   // Chat templating — uses the model's GGUF metadata template
   applyChatTemplate(
     handle: number,
-    rolesJson: string,         // JSON array of {role, content}
+    rolesJson: string, // JSON array of {role, content}
     addAssistantHeader: boolean
   ): Promise<string>;
 
@@ -39,6 +39,38 @@ export interface Spec extends TurboModule {
     nEmbd: number;
     modelSizeBytes: number;
   }>;
+
+  // ---- Model lifecycle (download + cache) ----
+  // Streams progress via the "BitnetDownloadProgress" event keyed by cacheKey.
+  // expectedSizeBytes / expectedSha256: pass -1 / "" when unknown.
+  startDownload(
+    cacheKey: string,
+    modelRef: string,
+    url: string,
+    authHeader: string,
+    expectedSizeBytes: number,
+    expectedSha256: string
+  ): Promise<{
+    localPath: string;
+    sizeBytes: number;
+    sha256: string;
+    resumed: boolean;
+  }>;
+
+  cancelDownload(cacheKey: string): void;
+
+  // Returns a JSON-encoded array of CachedModelEntry (matches the rolesJson
+  // pattern of applyChatTemplate — codegen support for arrays-of-objects is
+  // inconsistent, so we stringify on the native side).
+  listModels(): Promise<string>;
+
+  deleteModel(modelRef: string): Promise<boolean>;
+
+  getCacheSize(): Promise<number>;
+
+  getCacheDir(): Promise<string>;
+
+  isModelCached(modelRef: string): Promise<boolean>;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('Bitnet');

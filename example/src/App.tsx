@@ -11,22 +11,69 @@ import {
   KeyboardAvoidingView,
   Platform,
   Pressable,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from 'react-native';
-import { Engine, type ChatMessage } from 'react-native-bitnet';
+import {
+  SafeAreaProvider,
+  useSafeAreaInsets,
+} from 'react-native-safe-area-context';
+import {
+  Engine,
+  Models,
+  type ChatMessage,
+  type DownloadProgress,
+  type ModelRef,
+} from 'react-native-bitnet';
+import { ModelsPanel } from './ModelsPanel';
 
-const MODEL_PATH = '/data/data/bitnet.example/files/model.gguf';
+export type CatalogEntry = { ref: ModelRef; name: string; note?: string };
+
+// Curated list shown in the model picker. Add more entries here as needed —
+// the picker also has a freeform input for arbitrary hf:// / https:// refs.
+export const CATALOG: CatalogEntry[] = [
+  {
+    ref: 'hf://microsoft/bitnet-b1.58-2B-4T-gguf/ggml-model-i2_s.gguf',
+    name: 'BitNet b1.58 2B-4T · i2_s',
+    note: '~1.18 GB · 2-bit quantized',
+  },
+];
+
+const DEFAULT_REF: ModelRef = CATALOG[0]!.ref;
 const DEFAULT_SYSTEM = 'You are a helpful assistant.';
 
-type LoadState = 'loading' | 'ready' | { error: string };
+type LoadState =
+  | { phase: 'downloading'; progress: DownloadProgress | null }
+  | { phase: 'loading' }
+  | { phase: 'ready' }
+  | { phase: 'error'; message: string };
+
+export function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
 
 export default function App() {
-  const [loadState, setLoadState] = useState<LoadState>('loading');
+  return (
+    <SafeAreaProvider>
+      <AppContent />
+    </SafeAreaProvider>
+  );
+}
+
+function AppContent() {
+  const insets = useSafeAreaInsets();
+  const [activeRef, setActiveRef] = useState<ModelRef>(DEFAULT_REF);
+  const [showModels, setShowModels] = useState(false);
+  const [loadState, setLoadState] = useState<LoadState>({
+    phase: 'downloading',
+    progress: null,
+  });
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [system, setSystem] = useState(DEFAULT_SYSTEM);
@@ -46,27 +93,50 @@ export default function App() {
 
   useEffect(() => {
     mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // Re-runs whenever `activeRef` changes. Cleanup aborts the in-flight
+  // download/load and disposes the previous engine, so switching is one-tap.
+  useEffect(() => {
+    const controller = new AbortController();
 
     (async () => {
+      setLoadState({ phase: 'downloading', progress: null });
+      setMessages([]);
       try {
+        const entry = await Models.download(activeRef, {
+          signal: controller.signal,
+          onProgress: (p) => {
+            if (mountedRef.current && !controller.signal.aborted) {
+              setLoadState({ phase: 'downloading', progress: p });
+            }
+          },
+        });
+        if (controller.signal.aborted) return;
+
+        setLoadState({ phase: 'loading' });
         const engine = await Engine.load({
-          modelPath: MODEL_PATH,
+          modelPath: entry.localPath,
           threads: 4,
         });
-        if (!mountedRef.current) {
+        if (controller.signal.aborted) {
           engine.dispose();
           return;
         }
         engineRef.current = engine;
-        setLoadState('ready');
+        setLoadState({ phase: 'ready' });
       } catch (e: unknown) {
+        if (controller.signal.aborted) return;
         const msg = e instanceof Error ? e.message : String(e);
-        if (mountedRef.current) setLoadState({ error: msg });
+        if (mountedRef.current) setLoadState({ phase: 'error', message: msg });
       }
     })();
 
     return () => {
-      mountedRef.current = false;
+      controller.abort();
       const engine = engineRef.current;
       engineRef.current = null;
       if (engine) {
@@ -84,7 +154,16 @@ export default function App() {
         }
       }
     };
-  }, []);
+  }, [activeRef]);
+
+  const handleSwitch = useCallback(
+    (ref: ModelRef) => {
+      if (ref === activeRef) return;
+      cancelRequestedRef.current = true;
+      setActiveRef(ref);
+    },
+    [activeRef]
+  );
 
   const appendToLastAssistant = useCallback((token: string) => {
     if (!mountedRef.current) return;
@@ -99,7 +178,12 @@ export default function App() {
   const send = useCallback(async () => {
     const engine = engineRef.current;
     const text = input.trim();
-    if (!engine || loadState !== 'ready' || streaming || text.length === 0) {
+    if (
+      !engine ||
+      loadState.phase !== 'ready' ||
+      streaming ||
+      text.length === 0
+    ) {
       return;
     }
 
@@ -157,13 +241,21 @@ export default function App() {
   }, [streaming]);
 
   const canSend =
-    loadState === 'ready' && !streaming && input.trim().length > 0;
+    loadState.phase === 'ready' && !streaming && input.trim().length > 0;
 
   return (
-    <SafeAreaView style={styles.container}>
-      <View style={styles.header}>
-        <Text style={styles.title}>BitNet chat</Text>
+    <View style={styles.container}>
+      <View style={[styles.header, { paddingTop: insets.top + 12 }]}>
+        <Text style={styles.title} numberOfLines={1}>
+          BitNet chat
+        </Text>
         <View style={styles.headerActions}>
+          <Pressable
+            onPress={() => setShowModels(true)}
+            style={styles.headerBtn}
+          >
+            <Text style={styles.headerBtnText}>Models</Text>
+          </Pressable>
           <Pressable
             onPress={() => setShowSystem((v) => !v)}
             style={styles.headerBtn}
@@ -196,21 +288,33 @@ export default function App() {
         </View>
       )}
 
-      {loadState !== 'ready' && (
+      {loadState.phase !== 'ready' && (
         <View
           style={[
             styles.banner,
-            typeof loadState === 'object' && styles.bannerError,
+            loadState.phase === 'error' && styles.bannerError,
           ]}
         >
-          {loadState === 'loading' ? (
+          {loadState.phase === 'downloading' ? (
+            <>
+              <ActivityIndicator color="#fff" />
+              <Text style={styles.bannerText}>
+                {loadState.progress
+                  ? `Downloading model… ${fmtBytes(loadState.progress.bytesDownloaded)}` +
+                    (loadState.progress.totalBytes > 0
+                      ? ` / ${fmtBytes(loadState.progress.totalBytes)} (${Math.round((loadState.progress.bytesDownloaded / loadState.progress.totalBytes) * 100)}%)`
+                      : '')
+                  : 'Preparing download…'}
+              </Text>
+            </>
+          ) : loadState.phase === 'loading' ? (
             <>
               <ActivityIndicator color="#fff" />
               <Text style={styles.bannerText}>Loading model…</Text>
             </>
           ) : (
             <Text style={styles.bannerText}>
-              Failed to load: {loadState.error}
+              Failed to load: {loadState.message}
             </Text>
           )}
         </View>
@@ -255,14 +359,19 @@ export default function App() {
           )}
         </ScrollView>
 
-        <View style={styles.footer}>
+        <View
+          style={[
+            styles.footer,
+            { paddingBottom: Math.max(insets.bottom, 10) },
+          ]}
+        >
           <TextInput
             style={styles.input}
             value={input}
             onChangeText={setInput}
             placeholder="Message"
             placeholderTextColor="#666"
-            editable={loadState === 'ready' && !streaming}
+            editable={loadState.phase === 'ready' && !streaming}
             returnKeyType="send"
             blurOnSubmit={false}
             onSubmitEditing={send}
@@ -282,7 +391,15 @@ export default function App() {
           )}
         </View>
       </KeyboardAvoidingView>
-    </SafeAreaView>
+
+      <ModelsPanel
+        visible={showModels}
+        activeRef={activeRef}
+        catalog={CATALOG}
+        onClose={() => setShowModels(false)}
+        onSwitch={handleSwitch}
+      />
+    </View>
   );
 }
 
@@ -298,10 +415,16 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: '#222',
   },
-  title: { color: '#fff', fontSize: 16, fontWeight: '600' },
-  headerActions: { flexDirection: 'row', gap: 8 },
+  title: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+    flexShrink: 1,
+    marginRight: 8,
+  },
+  headerActions: { flexDirection: 'row', gap: 6, flexShrink: 0 },
   headerBtn: {
-    paddingHorizontal: 10,
+    paddingHorizontal: 8,
     paddingVertical: 6,
     borderRadius: 6,
     backgroundColor: '#1f1f1f',

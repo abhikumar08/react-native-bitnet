@@ -19,6 +19,16 @@ class BitnetModule(private val reactContext: ReactApplicationContext) :
     }
   }
 
+  init {
+    // Recover any entries that were "in progress" when the previous process died.
+    // Marks them with E_INTERRUPTED so the UI can present a resumable state.
+    try {
+      ModelCache.runCrashRecoverySweep(reactContext)
+    } catch (_: Throwable) {
+      // Crash recovery is best-effort — never break module init.
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Native methods. Implemented in cpp/bitnet_jni.cpp.
   // The Long handle on the Kotlin side is a reinterpret of a C++ pointer.
@@ -122,6 +132,81 @@ class BitnetModule(private val reactContext: ReactApplicationContext) :
       promise.resolve(map)
     } catch (t: Throwable) {
       promise.reject("E_INFO_FAILED", t.message ?: "getModelInfo threw", t)
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Model lifecycle — download, cache, list, delete. Delegates to ModelDownloader
+  // (work + dedup map) and ModelCache (paths + meta IO). See ADR / plan doc for
+  // the persistence model.
+  // ---------------------------------------------------------------------------
+
+  override fun startDownload(
+    cacheKey: String,
+    modelRef: String,
+    url: String,
+    authHeader: String,
+    expectedSizeBytes: Double,
+    expectedSha256: String,
+    promise: Promise,
+  ) {
+    try {
+      ModelDownloader.start(
+        reactContext,
+        cacheKey, modelRef, url, authHeader,
+        expectedSizeBytes.toLong(), expectedSha256,
+        promise,
+      )
+    } catch (t: Throwable) {
+      promise.reject("E_NETWORK", t.message ?: "startDownload threw", t)
+    }
+  }
+
+  override fun cancelDownload(cacheKey: String) {
+    try {
+      ModelDownloader.cancel(cacheKey)
+    } catch (_: Throwable) {
+      // best-effort
+    }
+  }
+
+  override fun listModels(promise: Promise) {
+    try {
+      promise.resolve(ModelCache.listJson(reactContext))
+    } catch (t: Throwable) {
+      promise.reject("E_CACHE", t.message ?: "listModels threw", t)
+    }
+  }
+
+  override fun deleteModel(modelRef: String, promise: Promise) {
+    try {
+      promise.resolve(ModelDownloader.deleteWithInFlightCheck(reactContext, modelRef))
+    } catch (t: Throwable) {
+      promise.reject("E_CACHE", t.message ?: "deleteModel threw", t)
+    }
+  }
+
+  override fun getCacheSize(promise: Promise) {
+    try {
+      promise.resolve(ModelCache.totalSize(reactContext).toDouble())
+    } catch (t: Throwable) {
+      promise.reject("E_CACHE", t.message ?: "getCacheSize threw", t)
+    }
+  }
+
+  override fun getCacheDir(promise: Promise) {
+    try {
+      promise.resolve(ModelCache.cacheRoot(reactContext).absolutePath)
+    } catch (t: Throwable) {
+      promise.reject("E_CACHE", t.message ?: "getCacheDir threw", t)
+    }
+  }
+
+  override fun isModelCached(modelRef: String, promise: Promise) {
+    try {
+      promise.resolve(ModelCache.isCached(reactContext, modelRef))
+    } catch (t: Throwable) {
+      promise.reject("E_CACHE", t.message ?: "isModelCached threw", t)
     }
   }
 }

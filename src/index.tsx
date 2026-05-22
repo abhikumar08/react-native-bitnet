@@ -1,12 +1,24 @@
 import { NativeEventEmitter, NativeModules, Platform } from 'react-native';
 import NativeBitnet from './NativeBitnet';
+import { Models, type DownloadOptions, type ModelRef } from './models';
 
 // Event emitter for streaming tokens. On Android, NativeEventEmitter wraps
 // DeviceEventEmitter; on iOS it requires the module to expose
-// supportedEvents/addListener/removeListeners (NOOP for our case).
+// supportedEvents/addListener/removeListeners.
 const eventEmitter = new NativeEventEmitter(
   Platform.OS === 'ios' ? NativeModules.Bitnet : undefined
 );
+
+export { Models };
+export type {
+  ModelRef,
+  DownloadOptions,
+  DownloadProgress,
+  CachedModelEntry,
+  ResumeAllOptions,
+  ResumeAllResult,
+  ResumeSkipRules,
+} from './models';
 
 export type ChatMessage = {
   role: 'system' | 'user' | 'assistant';
@@ -19,7 +31,7 @@ export type GenerationParams = {
   topK?: number;
   topP?: number;
   seed?: number;
-  onToken?: (token: string) => void;  // streaming callback
+  onToken?: (token: string) => void; // streaming callback
 };
 
 export type ModelInfo = {
@@ -31,7 +43,12 @@ export type ModelInfo = {
 };
 
 export type EngineConfig = {
-  modelPath: string;
+  // Exactly one of modelPath / modelRef is required.
+  // modelPath: absolute path to a GGUF already on disk (sideloaded, bundled, etc.).
+  // modelRef: "hf://owner/repo/file.gguf[@revision]" or "https://...". SDK downloads + caches.
+  modelPath?: string;
+  modelRef?: ModelRef;
+  downloadOptions?: DownloadOptions;
   contextSize?: number;
   threads?: number;
   batchSize?: number;
@@ -46,8 +63,24 @@ export class Engine {
   }
 
   static async load(config: EngineConfig): Promise<Engine> {
+    if (config.modelPath && config.modelRef) {
+      throw new Error(
+        'Engine.load: provide either modelPath or modelRef, not both.'
+      );
+    }
+    let modelPath = config.modelPath;
+    if (config.modelRef) {
+      const entry = await Models.download(
+        config.modelRef,
+        config.downloadOptions
+      );
+      modelPath = entry.localPath;
+    }
+    if (!modelPath) {
+      throw new Error('Engine.load: modelPath or modelRef must be provided.');
+    }
     const handle = await NativeBitnet.loadModel(
-      config.modelPath,
+      modelPath,
       config.contextSize ?? 2048,
       config.threads ?? 4,
       config.batchSize ?? 512
@@ -55,13 +88,16 @@ export class Engine {
     return new Engine(handle);
   }
 
-  async generate(prompt: string, params: GenerationParams = {}): Promise<string> {
+  async generate(
+    prompt: string,
+    params: GenerationParams = {}
+  ): Promise<string> {
     this.throwIfDisposed();
 
     let subscription: { remove: () => void } | undefined;
     if (params.onToken) {
       const cb = params.onToken;
-      subscription = eventEmitter.addListener('BitnetToken', (event) => {
+      subscription = eventEmitter.addListener('BitnetToken', (event: any) => {
         if (event.handle === this.handle) cb(event.token);
       });
     }
