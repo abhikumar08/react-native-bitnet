@@ -28,6 +28,15 @@ function makeEngineBusyError(): Error & { code: string } {
   return err;
 }
 
+function makeEngineDisposedError(): Error & { code: string } {
+  const err = new Error(
+    'Engine has been disposed. Load a new engine with Engine.load() ' +
+      'to continue.'
+  ) as Error & { code: string };
+  err.code = 'E_ENGINE_DISPOSED';
+  return err;
+}
+
 // AbortError. We don't rely on the global DOMException (not consistently
 // available in React Native's Hermes runtime) — a tagged Error subclass is
 // sufficient. The `name === 'AbortError'` shape is what AbortController-aware
@@ -732,9 +741,7 @@ export class Engine {
   }
 
   private throwIfDisposed(): void {
-    if (this.disposed) {
-      throw new Error('Engine has been disposed');
-    }
+    if (this.disposed) throw makeEngineDisposedError();
   }
 }
 

@@ -371,7 +371,7 @@ Caveats:
 
 ### `engine.cancel(): void`
 
-Cancels an in-flight generation.
+Cancels an in-flight generation. Idempotent — safe to call when nothing is in flight.
 
 ### `engine.applyChatTemplate(messages: ChatMessage[], addAssistantHeader?: boolean): Promise<string>`
 
@@ -394,7 +394,15 @@ Returns metadata:
 
 ### `engine.dispose(): void`
 
-Releases native engine resources. After dispose, calls throw an error.
+Releases native engine resources. Idempotent — calling twice is safe.
+
+### Error codes
+
+The SDK throws `Error` instances with a `.code` string property for typed conditions. Pattern-match on `.code` rather than the message:
+
+- `E_ENGINE_BUSY` — thrown by `generate` / `stream` / `chat.completions.create` when another generation is already in flight on the same `Engine`. Await the in-flight call or invoke `engine.cancel()` first.
+- `E_ENGINE_DISPOSED` — thrown by any `Engine` method (other than `dispose` itself) after `engine.dispose()` has been called. Load a fresh engine with `Engine.load()` to continue.
+- `AbortError` (`.name === 'AbortError'`, no `.code`) — thrown when an `AbortSignal` passed to `generate` / `stream` / `chat.completions.create` fires before completion. Web-standard shape; see the Aborting section above.
 
 ## Model lifecycle
 

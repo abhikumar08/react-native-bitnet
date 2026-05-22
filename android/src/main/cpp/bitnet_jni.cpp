@@ -453,10 +453,22 @@ Java_com_bitnet_BitnetModule_nativeGenerate(
 
 JNIEXPORT void JNICALL
 Java_com_bitnet_BitnetModule_nativeCancelGeneration(
-    JNIEnv* /*env*/, jobject /*thiz*/, jlong handle)
+    JNIEnv* env, jobject /*thiz*/, jlong handle)
 {
     auto* engine = registry().get(handle);
-    if (engine) engine->cancel();
+    if (!engine) {
+        // Match the lookup-and-throw pattern of nativeGenerate /
+        // nativeApplyChatTemplate / nativeGetModelInfo. Used to silently
+        // no-op here, which diverged from every other JNI method on a
+        // disposed handle. JS callers see this as E_ENGINE_DISPOSED via
+        // the Engine.throwIfDisposed guard; internal cancel call sites
+        // (stream's iterator.return(), AbortSignal listener) already
+        // swallow exceptions, so the runtime UX is unchanged.
+        jclass exc = env->FindClass("java/lang/IllegalStateException");
+        if (exc) env->ThrowNew(exc, "engine handle is invalid (disposed?)");
+        return;
+    }
+    engine->cancel();
 }
 
 JNIEXPORT jstring JNICALL
