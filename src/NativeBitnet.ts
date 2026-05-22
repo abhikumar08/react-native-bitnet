@@ -18,8 +18,12 @@ export interface Spec extends TurboModule {
   // finishReason is typed as `string` here because codegen string-literal
   // unions are flaky on older RN; the public Engine.generate() narrows to
   // 'length' | 'stop' | 'cancelled'.
+  // requestId is an opaque per-call id the SDK generates; native echoes it
+  // back on every BitnetToken event so listeners can filter out stale
+  // tokens from a just-cancelled run.
   generate(
     handle: number,
+    requestId: number,
     prompt: string,
     maxTokens: number,
     temperature: number,

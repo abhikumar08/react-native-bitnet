@@ -9,6 +9,25 @@ const eventEmitter = new NativeEventEmitter(
   Platform.OS === 'ios' ? NativeModules.Bitnet : undefined
 );
 
+// Monotonic per-call id passed to native and echoed back on each BitnetToken
+// event. Listeners filter on this in addition to `handle` so a just-cancelled
+// generation's residual tokens can't leak into the next subscription. Module
+// scope is fine — JS is single-threaded so increments are atomic and the
+// space (2^53 IDs) won't realistically wrap.
+let nextRequestId = 1;
+function makeRequestId(): number {
+  return nextRequestId++;
+}
+
+function makeEngineBusyError(): Error & { code: string } {
+  const err = new Error(
+    'Another generate() is already in progress on this engine. ' +
+      'Await the in-flight call or call engine.cancel() first.'
+  ) as Error & { code: string };
+  err.code = 'E_ENGINE_BUSY';
+  return err;
+}
+
 export { Models };
 export type {
   ModelRef,
@@ -109,6 +128,11 @@ export type EngineConfig = {
 export class Engine {
   private handle: number;
   private disposed = false;
+  // Single-flight gate on this engine instance. `generate()` / `stream()`
+  // both set this true on entry and clear it when the underlying native
+  // call settles. A second invocation while busy throws E_ENGINE_BUSY
+  // synchronously — no Promise round-trip needed.
+  private busy = false;
 
   private constructor(handle: number) {
     this.handle = handle;
@@ -145,24 +169,32 @@ export class Engine {
     params: GenerationParams = {}
   ): Promise<GenerationResult> {
     this.throwIfDisposed();
+    if (this.busy) throw makeEngineBusyError();
+    this.busy = true;
 
+    // Pre-declare so the finally block can reach it even if subscribe throws.
     let subscription: { remove: () => void } | undefined;
-    if (params.onToken) {
-      const cb = params.onToken;
-      subscription = eventEmitter.addListener('BitnetToken', (event: any) => {
-        if (event.handle === this.handle) cb(event.token);
-      });
-    }
-
-    const stopArray =
-      typeof params.stop === 'string' ? [params.stop] : (params.stop ?? []);
-
     try {
+      const requestId = makeRequestId();
+
+      if (params.onToken) {
+        const cb = params.onToken;
+        subscription = eventEmitter.addListener('BitnetToken', (event: any) => {
+          if (event.handle === this.handle && event.requestId === requestId) {
+            cb(event.token);
+          }
+        });
+      }
+
+      const stopArray =
+        typeof params.stop === 'string' ? [params.stop] : (params.stop ?? []);
+
       // Cast narrows the spec-layer `finishReason: string` to our
       // FinishReason union. The native side only ever resolves with one of
       // those three values.
       const raw = await NativeBitnet.generate(
         this.handle,
+        requestId,
         prompt,
         params.maxTokens ?? 256,
         params.temperature ?? 0.8,
@@ -177,7 +209,10 @@ export class Engine {
       );
       return raw as GenerationResult;
     } finally {
+      // Always reached, so a synchronous throw during setup (subscribe,
+      // JSON.stringify, etc.) doesn't leave the engine permanently busy.
       subscription?.remove();
+      this.busy = false;
     }
   }
 
@@ -191,114 +226,132 @@ export class Engine {
   // keep churning to maxTokens after the consumer walks away.
   stream(prompt: string, params: GenerationParams = {}): GenerationStream {
     this.throwIfDisposed();
+    if (this.busy) throw makeEngineBusyError();
+    this.busy = true;
 
-    const handle = this.handle;
-    // Chunks that arrived before the consumer called next() — drained FIFO
-    // on subsequent next() calls.
-    const queue: GenerationChunk[] = [];
-    // Resolvers for next() calls that arrived before any chunk. A queue,
-    // not a single slot, so concurrent next() invocations (uncommon with
-    // `for await`, but legal with manual iterator use) don't silently
-    // overwrite each other's resolver.
-    const waiters: ((r: IteratorResult<GenerationChunk>) => void)[] = [];
-    let finished = false;
-    let cancelled = false;
+    try {
+      const handle = this.handle;
+      const requestId = makeRequestId();
+      // Chunks that arrived before the consumer called next() — drained FIFO
+      // on subsequent next() calls.
+      const queue: GenerationChunk[] = [];
+      // Resolvers for next() calls that arrived before any chunk. A queue,
+      // not a single slot, so concurrent next() invocations (uncommon with
+      // `for await`, but legal with manual iterator use) don't silently
+      // overwrite each other's resolver.
+      const waiters: ((r: IteratorResult<GenerationChunk>) => void)[] = [];
+      let finished = false;
+      let cancelled = false;
 
-    const subscription = eventEmitter.addListener(
-      'BitnetToken',
-      (event: any) => {
-        if (event.handle !== handle || finished) return;
-        const chunk: GenerationChunk = { delta: event.token };
-        const w = waiters.shift();
-        if (w) {
-          w({ value: chunk, done: false });
-        } else {
-          queue.push(chunk);
-        }
-      }
-    );
-
-    const stopArray =
-      typeof params.stop === 'string' ? [params.stop] : (params.stop ?? []);
-
-    // Kick off native generation. We do NOT thread params.onToken — the
-    // async-iterator IS this method's streaming surface. Callers wanting
-    // the callback style should use engine.generate() instead.
-    const resultPromise: Promise<GenerationResult> = NativeBitnet.generate(
-      handle,
-      prompt,
-      params.maxTokens ?? 256,
-      params.temperature ?? 0.8,
-      params.topK ?? 40,
-      params.topP ?? 0.95,
-      params.seed ?? 0,
-      JSON.stringify(stopArray),
-      params.repeatPenalty ?? 1.1,
-      params.repeatLastN ?? 64,
-      params.frequencyPenalty ?? 0.0,
-      params.presencePenalty ?? 0.0
-    ).then((raw) => raw as GenerationResult);
-
-    // Settle pending waiters and remove the subscription when generation
-    // finishes, whether by success or error. Wrapped in catch so any
-    // cleanup failure can't become an unhandled rejection on the
-    // discarded Promise returned by .finally().
-    resultPromise
-      .finally(() => {
-        finished = true;
-        try {
-          subscription.remove();
-        } catch {
-          // listener already gone
-        }
-        while (waiters.length > 0) {
-          const w = waiters.shift()!;
-          w({ value: undefined as never, done: true });
-        }
-      })
-      .catch(() => {
-        // resultPromise's rejection reaches the caller via stream.result;
-        // we just don't want it to also crash here.
-      });
-
-    const iterator: AsyncIterator<GenerationChunk> = {
-      next() {
-        if (queue.length > 0) {
-          return Promise.resolve({ value: queue.shift()!, done: false });
-        }
-        if (finished) {
-          return Promise.resolve({ value: undefined as never, done: true });
-        }
-        return new Promise((resolve) => {
-          waiters.push(resolve);
-        });
-      },
-      return() {
-        if (!cancelled && !finished) {
-          cancelled = true;
-          try {
-            NativeBitnet.cancelGeneration(handle);
-          } catch {
-            // engine disposed mid-stream — nothing to cancel
+      const subscription = eventEmitter.addListener(
+        'BitnetToken',
+        (event: any) => {
+          if (
+            event.handle !== handle ||
+            event.requestId !== requestId ||
+            finished
+          )
+            return;
+          const chunk: GenerationChunk = { delta: event.token };
+          const w = waiters.shift();
+          if (w) {
+            w({ value: chunk, done: false });
+          } else {
+            queue.push(chunk);
           }
         }
-        // Drain any pending waiters with done=true so they unblock
-        // immediately rather than waiting for the native cancel to round-
-        // trip back through the generate Promise.
-        while (waiters.length > 0) {
-          const w = waiters.shift()!;
-          w({ value: undefined as never, done: true });
-        }
-        return Promise.resolve({ value: undefined as never, done: true });
-      },
-    };
+      );
 
-    return {
-      [Symbol.asyncIterator]() {
-        return iterator;
-      },
-      result: resultPromise,
-    };
+      const stopArray =
+        typeof params.stop === 'string' ? [params.stop] : (params.stop ?? []);
+
+      // Kick off native generation. We do NOT thread params.onToken — the
+      // async-iterator IS this method's streaming surface. Callers wanting
+      // the callback style should use engine.generate() instead.
+      const resultPromise: Promise<GenerationResult> = NativeBitnet.generate(
+        handle,
+        requestId,
+        prompt,
+        params.maxTokens ?? 256,
+        params.temperature ?? 0.8,
+        params.topK ?? 40,
+        params.topP ?? 0.95,
+        params.seed ?? 0,
+        JSON.stringify(stopArray),
+        params.repeatPenalty ?? 1.1,
+        params.repeatLastN ?? 64,
+        params.frequencyPenalty ?? 0.0,
+        params.presencePenalty ?? 0.0
+      ).then((raw) => raw as GenerationResult);
+
+      // Settle pending waiters and remove the subscription when generation
+      // finishes, whether by success or error. Wrapped in catch so any
+      // cleanup failure can't become an unhandled rejection on the
+      // discarded Promise returned by .finally().
+      resultPromise
+        .finally(() => {
+          finished = true;
+          this.busy = false;
+          try {
+            subscription.remove();
+          } catch {
+            // listener already gone
+          }
+          while (waiters.length > 0) {
+            const w = waiters.shift()!;
+            w({ value: undefined as never, done: true });
+          }
+        })
+        .catch(() => {
+          // resultPromise's rejection reaches the caller via stream.result;
+          // we just don't want it to also crash here.
+        });
+
+      const iterator: AsyncIterator<GenerationChunk> = {
+        next() {
+          if (queue.length > 0) {
+            return Promise.resolve({ value: queue.shift()!, done: false });
+          }
+          if (finished) {
+            return Promise.resolve({ value: undefined as never, done: true });
+          }
+          return new Promise((resolve) => {
+            waiters.push(resolve);
+          });
+        },
+        return() {
+          if (!cancelled && !finished) {
+            cancelled = true;
+            try {
+              NativeBitnet.cancelGeneration(handle);
+            } catch {
+              // engine disposed mid-stream — nothing to cancel
+            }
+          }
+          // Drain any pending waiters with done=true so they unblock
+          // immediately rather than waiting for the native cancel to round-
+          // trip back through the generate Promise.
+          while (waiters.length > 0) {
+            const w = waiters.shift()!;
+            w({ value: undefined as never, done: true });
+          }
+          return Promise.resolve({ value: undefined as never, done: true });
+        },
+      };
+
+      return {
+        [Symbol.asyncIterator]() {
+          return iterator;
+        },
+        result: resultPromise,
+      };
+    } catch (e) {
+      // Synchronous throw during setup before resultPromise was registered
+      // — release the busy slot so the engine isn't permanently wedged.
+      // On the success path, resultPromise.finally above clears it instead.
+      this.busy = false;
+      throw e;
+    }
   }
 
   cancel(): void {

@@ -19,6 +19,14 @@ class BitnetModule(private val reactContext: ReactApplicationContext) :
     }
   }
 
+  // Tracks which engine handles currently have a generate() in flight.
+  // BitnetEngine::generate is documented as not safe to call concurrently
+  // on the same instance (the llama_context's KV cache would race), so we
+  // reject overlapping calls with E_ENGINE_BUSY rather than serializing
+  // them. ConcurrentHashMap.putIfAbsent gives us an atomic check-and-set
+  // primitive without rolling a per-handle Mutex.
+  private val busyHandles = java.util.concurrent.ConcurrentHashMap<Long, Boolean>()
+
   init {
     // Recover any entries that were "in progress" when the previous process died.
     // Marks them with E_INTERRUPTED so the UI can present a resumable state.
@@ -36,7 +44,7 @@ class BitnetModule(private val reactContext: ReactApplicationContext) :
   private external fun nativeLoadModel(
     modelPath: String, nCtx: Int, nThreads: Int, nBatch: Int): Long
   private external fun nativeGenerate(
-    handle: Long, prompt: String,
+    handle: Long, requestId: Long, prompt: String,
     maxTokens: Int, temperature: Float, topK: Int, topP: Float, seed: Int,
     stopSequencesJson: String,
     repeatPenalty: Float, repeatLastN: Int,
@@ -53,9 +61,10 @@ class BitnetModule(private val reactContext: ReactApplicationContext) :
   // Kotlin run on the calling thread.
   // ---------------------------------------------------------------------------
   @Suppress("unused")
-  private fun emitToken(handle: Long, token: String) {
+  private fun emitToken(handle: Long, requestId: Long, token: String) {
     val map = WritableNativeMap().apply {
       putDouble("handle", handle.toDouble())
+      putDouble("requestId", requestId.toDouble())
       putString("token", token)
     }
     reactContext
@@ -87,18 +96,32 @@ class BitnetModule(private val reactContext: ReactApplicationContext) :
   }
 
   override fun generate(
-    handle: Double, prompt: String,
+    handle: Double, requestId: Double, prompt: String,
     maxTokens: Double, temperature: Double, topK: Double, topP: Double, seed: Double,
     stopSequencesJson: String,
     repeatPenalty: Double, repeatLastN: Double,
     frequencyPenalty: Double, presencePenalty: Double,
     promise: Promise
   ) {
+    val key = handle.toLong()
+    // Atomic check-and-set: if the key is absent, mark this handle busy and
+    // continue. If already present, another generate() is in flight on this
+    // engine — reject and bail. This is the native-side safety net; the JS
+    // layer also pre-checks, but defense-in-depth.
+    if (busyHandles.putIfAbsent(key, true) != null) {
+      promise.reject(
+        "E_ENGINE_BUSY",
+        "Another generate() is already in progress on this engine. " +
+          "Await the in-flight call or call engine.cancel() first."
+      )
+      return
+    }
+
     // Run on a background thread so we don't block the JS thread for tens of seconds.
     Thread {
       try {
         val json = nativeGenerate(
-          handle.toLong(), prompt,
+          key, requestId.toLong(), prompt,
           maxTokens.toInt(), temperature.toFloat(),
           topK.toInt(), topP.toFloat(), seed.toInt(),
           stopSequencesJson,
@@ -124,6 +147,10 @@ class BitnetModule(private val reactContext: ReactApplicationContext) :
         promise.resolve(result)
       } catch (t: Throwable) {
         promise.reject("E_GEN_FAILED", t.message ?: "generate threw", t)
+      } finally {
+        // Free the slot regardless of whether generate resolved, rejected,
+        // or returned cleanly via cancel.
+        busyHandles.remove(key)
       }
     }.start()
   }

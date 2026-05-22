@@ -72,6 +72,7 @@ RCT_EXPORT_MODULE()
 }
 
 - (void)generate:(double)handle
+             requestId:(double)requestId
                 prompt:(NSString *)prompt
              maxTokens:(double)maxTokens
            temperature:(double)temperature

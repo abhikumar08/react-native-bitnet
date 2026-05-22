@@ -309,7 +309,7 @@ Java_com_bitnet_BitnetModule_nativeLoadModel(
 JNIEXPORT jstring JNICALL
 Java_com_bitnet_BitnetModule_nativeGenerate(
     JNIEnv* env, jobject thiz,
-    jlong handle, jstring jPrompt,
+    jlong handle, jlong requestId, jstring jPrompt,
     jint maxTokens, jfloat temperature, jint topK, jfloat topP, jint seed,
     jstring jStopSequencesJson,
     jfloat repeatPenalty, jint repeatLastN,
@@ -336,9 +336,10 @@ Java_com_bitnet_BitnetModule_nativeGenerate(
         params.stop_sequences     = parse_string_array(j2s(env, jStopSequencesJson));
 
         // Resolve the emitToken Java method on this BitnetModule instance.
+        // Signature is (JJLjava/lang/String;)V — handle, requestId, token.
         jclass cls = env->GetObjectClass(thiz);
         jmethodID emitMethod = env->GetMethodID(
-            cls, "emitToken", "(JLjava/lang/String;)V");
+            cls, "emitToken", "(JJLjava/lang/String;)V");
 
         // Hold the JNIEnv* in a lambda capture — note this is the JS thread's
         // JNIEnv (we're called from a worker thread spawned by Kotlin). Calls
@@ -351,7 +352,7 @@ Java_com_bitnet_BitnetModule_nativeGenerate(
             [&](const std::string& piece) {
                 if (emitMethod) {
                     jstring jPiece = env->NewStringUTF(piece.c_str());
-                    env->CallVoidMethod(thiz, emitMethod, handle, jPiece);
+                    env->CallVoidMethod(thiz, emitMethod, handle, requestId, jPiece);
                     env->DeleteLocalRef(jPiece);
 
                     // Surface any exception thrown by emitToken as an early
