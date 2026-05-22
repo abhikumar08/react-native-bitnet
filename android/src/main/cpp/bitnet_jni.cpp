@@ -68,6 +68,70 @@ std::string j2s(JNIEnv* env, jstring jstr) {
     return result;
 }
 
+// Convert a std::string of standard UTF-8 bytes to a jstring via NewString.
+// Robust for the full Unicode range including 4-byte sequences (emoji,
+// supplementary-plane characters) that env->NewStringUTF rejects due to its
+// Modified-UTF-8 expectation. We must NOT use NewStringUTF for any content
+// derived from llama.cpp output — token pieces and JSON results can contain
+// 4-byte UTF-8 codepoints, and NewStringUTF aborts the process when it sees
+// one (e.g. the model emits 🙂 = 0xF0 0x9F 0x99 0x82).
+//
+// Invalid bytes are replaced with U+FFFD and the cursor advances by 1.
+// Empty input returns an empty jstring (NewString(nullptr, 0) is allowed
+// per the JNI spec).
+jstring utf8_to_jstring(JNIEnv* env, const std::string& s) {
+    if (s.empty()) return env->NewString(nullptr, 0);
+
+    std::vector<jchar> buf;
+    // size() is an upper bound: BMP characters produce ≤1 jchar per byte, and
+    // a 4-byte UTF-8 sequence produces 2 jchars (surrogate pair) but spans 4
+    // input bytes, so the ratio never exceeds 1.
+    buf.reserve(s.size());
+
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char b = static_cast<unsigned char>(s[i]);
+        uint32_t cp;
+        size_t len;
+        if (b < 0x80) {
+            cp = b;
+            len = 1;
+        } else if ((b & 0xE0) == 0xC0 && i + 1 < s.size()) {
+            cp = ((static_cast<uint32_t>(b) & 0x1F) << 6)
+               |  (static_cast<uint32_t>(s[i + 1]) & 0x3F);
+            len = 2;
+        } else if ((b & 0xF0) == 0xE0 && i + 2 < s.size()) {
+            cp = ((static_cast<uint32_t>(b) & 0x0F) << 12)
+               | ((static_cast<uint32_t>(s[i + 1]) & 0x3F) << 6)
+               |  (static_cast<uint32_t>(s[i + 2]) & 0x3F);
+            len = 3;
+        } else if ((b & 0xF8) == 0xF0 && i + 3 < s.size()) {
+            cp = ((static_cast<uint32_t>(b) & 0x07) << 18)
+               | ((static_cast<uint32_t>(s[i + 1]) & 0x3F) << 12)
+               | ((static_cast<uint32_t>(s[i + 2]) & 0x3F) << 6)
+               |  (static_cast<uint32_t>(s[i + 3]) & 0x3F);
+            len = 4;
+        } else {
+            // Invalid start byte or truncated trailing sequence. Emit the
+            // Unicode replacement character and advance one byte.
+            cp = 0xFFFD;
+            len = 1;
+        }
+
+        if (cp <= 0xFFFF) {
+            buf.push_back(static_cast<jchar>(cp));
+        } else {
+            // Supplementary plane → UTF-16 surrogate pair.
+            const uint32_t adjusted = cp - 0x10000;
+            buf.push_back(static_cast<jchar>(0xD800 | (adjusted >> 10)));
+            buf.push_back(static_cast<jchar>(0xDC00 | (adjusted & 0x3FF)));
+        }
+        i += len;
+    }
+
+    return env->NewString(buf.data(), static_cast<jsize>(buf.size()));
+}
+
 // Map a C++ FinishReason to the JS string our public API exposes.
 // OpenAI parity: EndOfSequence and StopSequence both collapse to "stop".
 // "cancelled" and "error" are on-device-specific extensions.
@@ -351,7 +415,7 @@ Java_com_bitnet_BitnetModule_nativeGenerate(
             params,
             [&](const std::string& piece) {
                 if (emitMethod) {
-                    jstring jPiece = env->NewStringUTF(piece.c_str());
+                    jstring jPiece = utf8_to_jstring(env, piece);
                     env->CallVoidMethod(thiz, emitMethod, handle, requestId, jPiece);
                     env->DeleteLocalRef(jPiece);
 
@@ -378,7 +442,7 @@ Java_com_bitnet_BitnetModule_nativeGenerate(
         json += "\"completionTokens\":"; json += std::to_string(result.tokens_generated);         json += ",";
         json += "\"wallTimeMs\":";     json += std::to_string(result.wall_time_ms);
         json += "}";
-        return env->NewStringUTF(json.c_str());
+        return utf8_to_jstring(env, json);
 
     } catch (const std::exception& e) {
         jclass exc = env->FindClass("java/lang/RuntimeException");
@@ -411,7 +475,7 @@ Java_com_bitnet_BitnetModule_nativeApplyChatTemplate(
         const std::string json = j2s(env, jRolesJson);
         auto messages = parse_messages(json);
         std::string rendered = engine->apply_chat_template(messages, addAssistantHeader);
-        return env->NewStringUTF(rendered.c_str());
+        return utf8_to_jstring(env, rendered);
     } catch (const std::exception& e) {
         jclass exc = env->FindClass("java/lang/RuntimeException");
         if (exc) env->ThrowNew(exc, e.what());
@@ -441,7 +505,7 @@ Java_com_bitnet_BitnetModule_nativeGetModelInfo(
         json += "\"nEmbd\":"          + std::to_string(info.n_embd) + ",";
         json += "\"modelSizeBytes\":" + std::to_string(info.model_size_bytes);
         json += "}";
-        return env->NewStringUTF(json.c_str());
+        return utf8_to_jstring(env, json);
     } catch (const std::exception& e) {
         jclass exc = env->FindClass("java/lang/RuntimeException");
         if (exc) env->ThrowNew(exc, e.what());
