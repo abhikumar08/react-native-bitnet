@@ -28,6 +28,26 @@ function makeEngineBusyError(): Error & { code: string } {
   return err;
 }
 
+// AbortError. We don't rely on the global DOMException (not consistently
+// available in React Native's Hermes runtime) — a tagged Error subclass is
+// sufficient. The `name === 'AbortError'` shape is what AbortController-aware
+// callers check.
+class AbortError extends Error {
+  constructor(message: string = 'The operation was aborted.') {
+    super(message);
+    this.name = 'AbortError';
+  }
+}
+
+// Convert an aborted AbortSignal into an Error to throw. If the signal's
+// `reason` is already an Error instance, we propagate that (matches Web spec
+// behavior where `controller.abort(myErr)` reaches catch handlers as `myErr`).
+function makeAbortError(signal?: AbortSignal): Error {
+  const reason = (signal as unknown as { reason?: unknown })?.reason;
+  if (reason instanceof Error) return reason;
+  return new AbortError(typeof reason === 'string' ? reason : undefined);
+}
+
 // Short opaque id for the synthetic `chatcmpl-…` field of the chat-completions
 // facade. Not crypto-strong; only for log correlation.
 function makeChatCompletionId(): string {
@@ -231,6 +251,13 @@ export type ChatCompletionChunk = {
 
 export type ChatCompletionStream = AsyncIterable<ChatCompletionChunk>;
 
+// Per-request options for the OpenAI-shape facade. Matches the second-arg
+// pattern of `openai.chat.completions.create(body, { signal })` so a
+// migrated call site doesn't have to relocate its AbortController wiring.
+export type ChatCompletionRequestOptions = {
+  signal?: AbortSignal;
+};
+
 export type GenerationParams = {
   maxTokens?: number;
   temperature?: number;
@@ -251,6 +278,14 @@ export type GenerationParams = {
   // OpenAI-style additive penalties. 0.0 = disabled.
   frequencyPenalty?: number;
   presencePenalty?: number;
+  // AbortController integration. Aborting causes the returned Promise (or
+  // the stream's iterator + .result) to reject with `AbortError`. If the
+  // signal is already aborted at the call site, generate()/stream() throw
+  // synchronously without entering the native side. Distinct from
+  // engine.cancel() — that resolves with `finishReason: 'cancelled'` and a
+  // partial GenerationResult; AbortSignal aborts reject. Use whichever
+  // matches your call style.
+  signal?: AbortSignal;
   onToken?: (token: string) => void; // streaming callback
 };
 
@@ -318,11 +353,21 @@ export class Engine {
     params: GenerationParams = {}
   ): Promise<GenerationResult> {
     this.throwIfDisposed();
+    // Pre-aborted signal: throw synchronously, never touch native. Matches
+    // web-standard AbortController behavior.
+    if (params.signal?.aborted) throw makeAbortError(params.signal);
     if (this.busy) throw makeEngineBusyError();
     this.busy = true;
 
-    // Pre-declare so the finally block can reach it even if subscribe throws.
+    // Pre-declare so the finally block can reach them even if subscribe throws.
     let subscription: { remove: () => void } | undefined;
+    let abortListener: (() => void) | undefined;
+    // Tracks whether the signal aborted DURING the await of native generate.
+    // Set true only by the listener; we read it after the await to decide
+    // whether to throw AbortError. (Reading params.signal.aborted directly
+    // would also pick up aborts that happened AFTER generation completed,
+    // which per web-standard should not affect a completed operation.)
+    let aborted = false;
     try {
       const requestId = makeRequestId();
 
@@ -333,6 +378,19 @@ export class Engine {
             cb(event.token);
           }
         });
+      }
+
+      if (params.signal) {
+        const signal = params.signal;
+        abortListener = () => {
+          aborted = true;
+          try {
+            NativeBitnet.cancelGeneration(this.handle);
+          } catch {
+            // engine disposed mid-flight — nothing to cancel
+          }
+        };
+        signal.addEventListener('abort', abortListener);
       }
 
       const stopArray =
@@ -356,10 +414,14 @@ export class Engine {
         params.frequencyPenalty ?? 0.0,
         params.presencePenalty ?? 0.0
       );
+      if (aborted) throw makeAbortError(params.signal);
       return raw as GenerationResult;
     } finally {
       // Always reached, so a synchronous throw during setup (subscribe,
       // JSON.stringify, etc.) doesn't leave the engine permanently busy.
+      if (abortListener && params.signal) {
+        params.signal.removeEventListener('abort', abortListener);
+      }
       subscription?.remove();
       this.busy = false;
     }
@@ -375,6 +437,8 @@ export class Engine {
   // keep churning to maxTokens after the consumer walks away.
   stream(prompt: string, params: GenerationParams = {}): GenerationStream {
     this.throwIfDisposed();
+    // Pre-aborted signal: throw synchronously, never touch native.
+    if (params.signal?.aborted) throw makeAbortError(params.signal);
     if (this.busy) throw makeEngineBusyError();
     this.busy = true;
 
@@ -384,13 +448,22 @@ export class Engine {
       // Chunks that arrived before the consumer called next() — drained FIFO
       // on subsequent next() calls.
       const queue: GenerationChunk[] = [];
-      // Resolvers for next() calls that arrived before any chunk. A queue,
-      // not a single slot, so concurrent next() invocations (uncommon with
-      // `for await`, but legal with manual iterator use) don't silently
-      // overwrite each other's resolver.
-      const waiters: ((r: IteratorResult<GenerationChunk>) => void)[] = [];
+      // Resolvers for next() calls that arrived before any chunk. Carries
+      // both resolve and reject so a signal-abort can settle a parked
+      // waiter with AbortError. (Previously a bare resolver-only queue.)
+      type Waiter = {
+        resolve: (r: IteratorResult<GenerationChunk>) => void;
+        reject: (err: Error) => void;
+      };
+      const waiters: Waiter[] = [];
       let finished = false;
       let cancelled = false;
+      // Signal-abort state. `aborted` flips true the moment the abort
+      // listener runs; `abortReason` holds the Error we'll surface via
+      // next() / .result.
+      let aborted = false;
+      let abortReason: Error | null = null;
+      let abortListener: (() => void) | undefined;
 
       const subscription = eventEmitter.addListener(
         'BitnetToken',
@@ -404,12 +477,32 @@ export class Engine {
           const chunk: GenerationChunk = { delta: event.token };
           const w = waiters.shift();
           if (w) {
-            w({ value: chunk, done: false });
+            w.resolve({ value: chunk, done: false });
           } else {
             queue.push(chunk);
           }
         }
       );
+
+      if (params.signal) {
+        const signal = params.signal;
+        abortListener = () => {
+          aborted = true;
+          abortReason = makeAbortError(signal);
+          // Drain any parked next() calls so they reject immediately
+          // rather than waiting for the native cancel to round-trip.
+          while (waiters.length > 0) {
+            const w = waiters.shift()!;
+            w.reject(abortReason);
+          }
+          try {
+            NativeBitnet.cancelGeneration(handle);
+          } catch {
+            // engine disposed mid-stream — nothing to cancel
+          }
+        };
+        signal.addEventListener('abort', abortListener);
+      }
 
       const stopArray =
         typeof params.stop === 'string' ? [params.stop] : (params.stop ?? []);
@@ -417,7 +510,7 @@ export class Engine {
       // Kick off native generation. We do NOT thread params.onToken — the
       // async-iterator IS this method's streaming surface. Callers wanting
       // the callback style should use engine.generate() instead.
-      const resultPromise: Promise<GenerationResult> = NativeBitnet.generate(
+      const nativeResult: Promise<GenerationResult> = NativeBitnet.generate(
         handle,
         requestId,
         prompt,
@@ -433,11 +526,26 @@ export class Engine {
         params.presencePenalty ?? 0.0
       ).then((raw) => raw as GenerationResult);
 
+      // The Promise we expose on .result. If the signal aborted during
+      // generation, surface AbortError instead of the underlying Cancelled
+      // result so the caller's `await stream.result` matches AbortController
+      // semantics.
+      const resultPromise: Promise<GenerationResult> = nativeResult.then(
+        (r) => {
+          if (aborted) throw abortReason!;
+          return r;
+        }
+      );
+      // Silence the rejection on the user-facing Promise *as a parallel
+      // observer* — this catch creates a sibling Promise; awaiting
+      // `resultPromise` still surfaces the rejection to the caller. Without
+      // this, an aborted stream whose caller didn't `await stream.result`
+      // would trigger an unhandled-rejection warning.
+      resultPromise.catch(() => {});
+
       // Settle pending waiters and remove the subscription when generation
-      // finishes, whether by success or error. Wrapped in catch so any
-      // cleanup failure can't become an unhandled rejection on the
-      // discarded Promise returned by .finally().
-      resultPromise
+      // finishes, whether by success or error.
+      nativeResult
         .finally(() => {
           finished = true;
           this.busy = false;
@@ -446,27 +554,37 @@ export class Engine {
           } catch {
             // listener already gone
           }
+          if (abortListener && params.signal) {
+            params.signal.removeEventListener('abort', abortListener);
+          }
           while (waiters.length > 0) {
             const w = waiters.shift()!;
-            w({ value: undefined as never, done: true });
+            if (aborted && abortReason) {
+              w.reject(abortReason);
+            } else {
+              w.resolve({ value: undefined as never, done: true });
+            }
           }
         })
         .catch(() => {
-          // resultPromise's rejection reaches the caller via stream.result;
-          // we just don't want it to also crash here.
+          // nativeResult's rejection (if any) reaches the caller via
+          // resultPromise; we just don't want it to also crash here.
         });
 
       const iterator: AsyncIterator<GenerationChunk> = {
         next() {
+          if (aborted && abortReason) return Promise.reject(abortReason);
           if (queue.length > 0) {
             return Promise.resolve({ value: queue.shift()!, done: false });
           }
           if (finished) {
             return Promise.resolve({ value: undefined as never, done: true });
           }
-          return new Promise((resolve) => {
-            waiters.push(resolve);
-          });
+          return new Promise<IteratorResult<GenerationChunk>>(
+            (resolve, reject) => {
+              waiters.push({ resolve, reject });
+            }
+          );
         },
         return() {
           if (!cancelled && !finished) {
@@ -477,12 +595,12 @@ export class Engine {
               // engine disposed mid-stream — nothing to cancel
             }
           }
-          // Drain any pending waiters with done=true so they unblock
-          // immediately rather than waiting for the native cancel to round-
-          // trip back through the generate Promise.
+          // for-await break is consumer-initiated, NOT a signal abort.
+          // Drain waiters with done=true (not reject) so the loop exits
+          // cleanly rather than throwing.
           while (waiters.length > 0) {
             const w = waiters.shift()!;
-            w({ value: undefined as never, done: true });
+            w.resolve({ value: undefined as never, done: true });
           }
           return Promise.resolve({ value: undefined as never, done: true });
         },
@@ -519,16 +637,24 @@ export class Engine {
   get chat() {
     type CreateFn = {
       (
-        params: ChatCompletionCreateParams & { stream: true }
+        params: ChatCompletionCreateParams & { stream: true },
+        options?: ChatCompletionRequestOptions
       ): Promise<ChatCompletionStream>;
       (
-        params: ChatCompletionCreateParams & { stream?: false }
+        params: ChatCompletionCreateParams & { stream?: false },
+        options?: ChatCompletionRequestOptions
       ): Promise<ChatCompletion>;
     };
     // Arrow function so `this` (the Engine instance) is captured from the
     // enclosing getter rather than rebound when called as
     // `engine.chat.completions.create(...)`.
-    const create: CreateFn = (async (params: ChatCompletionCreateParams) => {
+    const create: CreateFn = (async (
+      params: ChatCompletionCreateParams,
+      options?: ChatCompletionRequestOptions
+    ) => {
+      // Pre-aborted: bail before touching modelInfo / applyChatTemplate.
+      if (options?.signal?.aborted) throw makeAbortError(options.signal);
+
       const id = makeChatCompletionId();
       const created = Math.floor(Date.now() / 1000);
       const info = await this.modelInfo();
@@ -539,7 +665,12 @@ export class Engine {
       // we let that propagate — fixing it is a model concern, not the
       // facade's.
       const prompt = await this.applyChatTemplate(params.messages, true);
-      const genParams = pickGenerationParams(params);
+      // Forward the signal to the underlying generate/stream call so abort
+      // semantics work uniformly across all three call styles.
+      const genParams = {
+        ...pickGenerationParams(params),
+        signal: options?.signal,
+      };
 
       if (params.stream) {
         const upstream = this.stream(prompt, genParams);

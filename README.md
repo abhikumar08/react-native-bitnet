@@ -191,6 +191,52 @@ Param names follow this SDK's camelCase convention (`maxTokens`,
 `frequencyPenalty`, …); migrating call sites rename their param keys but the
 response destructuring stays identical to OpenAI code.
 
+#### Aborting with AbortController
+
+`engine.generate`, `engine.stream`, and `engine.chat.completions.create` all
+accept an `AbortSignal`. When the signal aborts, the in-flight call rejects
+with `AbortError` (web-standard) — the iterator throws on the awaiting
+consumer, and the `.result` Promise rejects.
+
+```ts
+const ac = new AbortController();
+setTimeout(() => ac.abort(), 500);
+
+// generate()
+try {
+	await engine.generate(prompt, { signal: ac.signal });
+} catch (e) {
+	if ((e as Error).name === 'AbortError') {
+		// aborted before generation completed
+	}
+}
+
+// stream()
+const stream = engine.stream(prompt, { signal: ac.signal });
+try {
+	for await (const chunk of stream) ui.append(chunk.delta);
+} catch (e) {
+	if ((e as Error).name === 'AbortError') { /* aborted */ }
+}
+
+// chat.completions.create — signal lives in the second-arg options object,
+// matching `openai.chat.completions.create(body, { signal })` exactly.
+const ccStream = await engine.chat.completions.create(
+	{ messages, stream: true },
+	{ signal: ac.signal }
+);
+```
+
+If `signal.aborted` is already `true` at the call site, the call throws
+synchronously (or rejects on the next microtask for `generate`) without
+entering native — no model load, no decode kicks off.
+
+`AbortSignal` is intentionally distinct from `engine.cancel()`. The
+former *rejects* with `AbortError` (use when the caller treats the
+operation as failed/abandoned); the latter resolves the Promise with
+`finishReason: 'cancelled'` and the partial `text` (use when the caller
+wants to keep what was generated). Pick whichever matches your call style.
+
 ### 4. Use chat templates (recommended for chat models)
 
 `applyChatTemplate` renders model-specific prompt formatting from GGUF metadata.
@@ -265,6 +311,7 @@ Generates text from a prompt. Resolves with the final text plus metadata; if `en
 - `repeatLastN?: number` (default `64`) — window used by `repeatPenalty`, `frequencyPenalty`, and `presencePenalty`.
 - `frequencyPenalty?: number` (default `0.0`) — OpenAI-style additive penalty proportional to recent frequency.
 - `presencePenalty?: number` (default `0.0`) — OpenAI-style additive penalty for any prior occurrence.
+- `signal?: AbortSignal` — optional. Aborting causes the Promise (and any `stream.result` / iterator) to reject with `AbortError`. Distinct from `engine.cancel()` (which resolves with `finishReason: 'cancelled'`).
 - `onToken?: (token: string) => void` — optional streaming callback. Receives complete UTF-8 chunks only (the SDK buffers across token boundaries so multibyte characters never split).
 
 `GenerationResult`:
@@ -284,9 +331,17 @@ Streaming generation as an async iterable. `GenerationParams` is the same as `en
 - `await stream.result` returns the same `GenerationResult` shape as `engine.generate`.
 - Breaking out of the loop (or calling `iterator.return()`) auto-invokes `engine.cancel()`. `.result` then resolves with `finishReason: 'cancelled'` and partial `text`.
 
-### `engine.chat.completions.create(params)`
+### `engine.chat.completions.create(params, options?)`
 
 OpenAI-shaped facade over `applyChatTemplate` + `generate`/`stream`. Params use this SDK's camelCase (`maxTokens`, `frequencyPenalty`, etc.); the result mirrors OpenAI's wire format with snake_case sub-fields, a `choices` array, and a `usage` object.
+
+The optional second argument `options` matches OpenAI's request-options shape:
+
+```ts
+type ChatCompletionRequestOptions = {
+	signal?: AbortSignal;
+};
+```
 
 ```ts
 type ChatCompletionCreateParams = {
