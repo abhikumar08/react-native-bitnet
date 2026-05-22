@@ -8,7 +8,7 @@
 
 **`apps/demo`.** The example app — a chat UI that exercises the public API the way a real consumer would. It owns the message list, the typing indicator, the cancel button, and the model-load lifecycle. It depends on nothing in the SDK except the public TypeScript surface.
 
-**`Engine` / `Bitnet`** (`src/index.tsx`). The public TypeScript API. `Engine.load()` is a static factory that returns a handle-wrapped instance; instance methods are `generate`, `generateStream`, `cancel`, `applyChatTemplate`, `modelInfo`, and `dispose`. This is the only file a consumer needs to read to use the SDK. Streaming is exposed two ways: an `onToken` callback (push) and an async iterator (pull). Both are surfaces over the same underlying event stream.
+**`Engine` / `Bitnet`** (`src/index.tsx`). The public TypeScript API. `Engine.load()` is a static factory that returns a handle-wrapped instance; instance methods are `generate`, `stream`, `cancel`, `applyChatTemplate`, `modelInfo`, and `dispose`. This is the only file a consumer needs to read to use the SDK. Streaming is exposed two ways: an `onToken` callback on `generate()` (push) and an async iterable returned by `stream()` (pull). Both are surfaces over the same underlying `BitnetToken` event stream.
 
 **`NativeBitnet`** (`src/NativeBitnet.ts`). The TurboModule spec. Declarative — no logic. React Native's codegen reads this file at build time and generates the C++ glue that marshals each method's arguments across the JS-to-JVM boundary. Every parameter type is constrained to what codegen supports: `string`, `number`, `boolean`, arrays of those, or a JSON-stringified object for anything richer (chat messages). Promise return types only — no synchronous calls.
 

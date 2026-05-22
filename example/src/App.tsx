@@ -271,14 +271,22 @@ function AppContent() {
         .map((s) => s.replace(/\\n/g, '\n').replace(/\\t/g, '\t').trim())
         .filter((s) => s.length > 0);
       const repeatPenalty = Number.parseFloat(repeatPenaltyText);
-      const result = await engine.generate(prompt, {
+      // Dogfood the async-iterator surface. The for-await loop is exactly
+      // what an OpenAI-API caller would write; tokens render incrementally
+      // via the same appendToLastAssistant. Tap Stop → engine.cancel() →
+      // stream loop exits naturally → stream.result resolves with
+      // finishReason: 'cancelled'.
+      const stream = engine.stream(prompt, {
         maxTokens: 256,
         temperature: 0.8,
         seed: 0,
         stop: stopList,
         repeatPenalty: Number.isFinite(repeatPenalty) ? repeatPenalty : 1.1,
-        onToken: appendToLastAssistant,
       });
+      for await (const chunk of stream) {
+        appendToLastAssistant(chunk.delta);
+      }
+      const result = await stream.result;
       if (mountedRef.current) setLastResult(result);
       console.log('[generate]', JSON.stringify(result));
     } catch (e: unknown) {

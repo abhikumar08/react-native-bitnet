@@ -135,6 +135,29 @@ const { text, finishReason, usage, wallTimeMs } = await engine.generate(prompt, 
 // `usage` is { promptTokens, completionTokens, totalTokens }.
 ```
 
+Or use the async-iterator style — drop-in for callers migrating from OpenAI's `stream: true`:
+
+```ts
+const stream = engine.stream(prompt, { maxTokens: 256, temperature: 0.8 });
+for await (const chunk of stream) {
+	process.stdout.write(chunk.delta);
+}
+// Final metadata (finishReason, usage, wallTimeMs) is awaited on .result:
+const { finishReason, usage } = await stream.result;
+```
+
+Breaking out of the loop auto-cancels the underlying generation:
+
+```ts
+for await (const chunk of engine.stream(prompt)) {
+	if (chunk.delta.includes('STOP')) break;  // engine.cancel() fires here
+}
+```
+
+`.result` always resolves (never rejects on cancel) — on early break it
+resolves with `finishReason: 'cancelled'` and `text` containing whatever
+streamed before the break.
+
 ### 4. Use chat templates (recommended for chat models)
 
 `applyChatTemplate` renders model-specific prompt formatting from GGUF metadata.
@@ -217,6 +240,16 @@ Generates text from a prompt. Resolves with the final text plus metadata; if `en
 - `finishReason: 'length' | 'stop' | 'cancelled'` — `'length'` = hit `maxTokens`; `'stop'` = model emitted EOS or a `stop` sequence matched; `'cancelled'` = caller invoked `engine.cancel()`.
 - `usage: { promptTokens, completionTokens, totalTokens }` — OpenAI-shaped token counts.
 - `wallTimeMs: number` — wall-clock time spent in this `generate()` call.
+
+### `engine.stream(prompt: string, params?: GenerationParams): GenerationStream`
+
+Streaming generation as an async iterable. `GenerationParams` is the same as `engine.generate` minus `onToken` (the iterator IS the streaming surface).
+
+`GenerationStream` is `AsyncIterable<GenerationChunk> & { result: Promise<GenerationResult> }`:
+
+- Each yielded chunk has shape `{ delta: string }` — incremental text, never a partial multi-byte UTF-8 sequence.
+- `await stream.result` returns the same `GenerationResult` shape as `engine.generate`.
+- Breaking out of the loop (or calling `iterator.return()`) auto-invokes `engine.cancel()`. `.result` then resolves with `finishReason: 'cancelled'` and partial `text`.
 
 ### `engine.cancel(): void`
 

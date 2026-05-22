@@ -46,6 +46,23 @@ export type GenerationResult = {
   wallTimeMs: number;
 };
 
+// One streamed chunk yielded by engine.stream(). `delta` is the incremental
+// text since the previous chunk; the SDK buffers across token boundaries so
+// this never contains a partial multi-byte UTF-8 sequence. The shape is an
+// object (not a bare string) so future fields (logprobs, role, tool calls)
+// can be added without breaking callers.
+export type GenerationChunk = {
+  delta: string;
+};
+
+// The return type of engine.stream(): an async iterable of deltas with a
+// side-channel Promise carrying the final GenerationResult. Awaiting
+// `.result` after the `for await` loop is how callers read finishReason,
+// usage, wallTimeMs, etc.
+export type GenerationStream = AsyncIterable<GenerationChunk> & {
+  result: Promise<GenerationResult>;
+};
+
 export type GenerationParams = {
   maxTokens?: number;
   temperature?: number;
@@ -162,6 +179,126 @@ export class Engine {
     } finally {
       subscription?.remove();
     }
+  }
+
+  // Streaming generation via an async iterable. Drop-in for OpenAI's
+  // `stream: true` callers. Yields one { delta } chunk per emitted token
+  // (combined safely across UTF-8 boundaries) and exposes the final
+  // GenerationResult on `.result`.
+  //
+  // Breaking out of the `for await` loop (or calling iterator.return()
+  // directly) auto-cancels the underlying generation — the engine doesn't
+  // keep churning to maxTokens after the consumer walks away.
+  stream(prompt: string, params: GenerationParams = {}): GenerationStream {
+    this.throwIfDisposed();
+
+    const handle = this.handle;
+    // Chunks that arrived before the consumer called next() — drained FIFO
+    // on subsequent next() calls.
+    const queue: GenerationChunk[] = [];
+    // Resolvers for next() calls that arrived before any chunk. A queue,
+    // not a single slot, so concurrent next() invocations (uncommon with
+    // `for await`, but legal with manual iterator use) don't silently
+    // overwrite each other's resolver.
+    const waiters: ((r: IteratorResult<GenerationChunk>) => void)[] = [];
+    let finished = false;
+    let cancelled = false;
+
+    const subscription = eventEmitter.addListener(
+      'BitnetToken',
+      (event: any) => {
+        if (event.handle !== handle || finished) return;
+        const chunk: GenerationChunk = { delta: event.token };
+        const w = waiters.shift();
+        if (w) {
+          w({ value: chunk, done: false });
+        } else {
+          queue.push(chunk);
+        }
+      }
+    );
+
+    const stopArray =
+      typeof params.stop === 'string' ? [params.stop] : (params.stop ?? []);
+
+    // Kick off native generation. We do NOT thread params.onToken — the
+    // async-iterator IS this method's streaming surface. Callers wanting
+    // the callback style should use engine.generate() instead.
+    const resultPromise: Promise<GenerationResult> = NativeBitnet.generate(
+      handle,
+      prompt,
+      params.maxTokens ?? 256,
+      params.temperature ?? 0.8,
+      params.topK ?? 40,
+      params.topP ?? 0.95,
+      params.seed ?? 0,
+      JSON.stringify(stopArray),
+      params.repeatPenalty ?? 1.1,
+      params.repeatLastN ?? 64,
+      params.frequencyPenalty ?? 0.0,
+      params.presencePenalty ?? 0.0
+    ).then((raw) => raw as GenerationResult);
+
+    // Settle pending waiters and remove the subscription when generation
+    // finishes, whether by success or error. Wrapped in catch so any
+    // cleanup failure can't become an unhandled rejection on the
+    // discarded Promise returned by .finally().
+    resultPromise
+      .finally(() => {
+        finished = true;
+        try {
+          subscription.remove();
+        } catch {
+          // listener already gone
+        }
+        while (waiters.length > 0) {
+          const w = waiters.shift()!;
+          w({ value: undefined as never, done: true });
+        }
+      })
+      .catch(() => {
+        // resultPromise's rejection reaches the caller via stream.result;
+        // we just don't want it to also crash here.
+      });
+
+    const iterator: AsyncIterator<GenerationChunk> = {
+      next() {
+        if (queue.length > 0) {
+          return Promise.resolve({ value: queue.shift()!, done: false });
+        }
+        if (finished) {
+          return Promise.resolve({ value: undefined as never, done: true });
+        }
+        return new Promise((resolve) => {
+          waiters.push(resolve);
+        });
+      },
+      return() {
+        if (!cancelled && !finished) {
+          cancelled = true;
+          try {
+            NativeBitnet.cancelGeneration(handle);
+          } catch {
+            // engine disposed mid-stream — nothing to cancel
+          }
+        }
+        // Drain any pending waiters with done=true so they unblock
+        // immediately rather than waiting for the native cancel to round-
+        // trip back through the generate Promise.
+        while (waiters.length > 0) {
+          const w = waiters.shift()!;
+          w({ value: undefined as never, done: true });
+        }
+        return Promise.resolve({ value: undefined as never, done: true });
+      },
+    };
+
+    return {
+      [Symbol.asyncIterator]() {
+        return iterator;
+      },
+      result: resultPromise,
+    };
   }
 
   cancel(): void {
