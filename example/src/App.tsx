@@ -97,6 +97,19 @@ function renderBitnetPrompt(messages: ChatMessage[]): string {
   return out;
 }
 
+// Parse a text input as a finite float; fall back if blank/NaN. Used by the
+// Advanced panel inputs so a partially-edited field doesn't propagate NaN
+// into the engine.
+function parseFloatOr(s: string, fallback: number): number {
+  const n = Number.parseFloat(s);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function parseIntOr(s: string, fallback: number): number {
+  const n = Number.parseInt(s, 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 export function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -128,7 +141,18 @@ function AppContent() {
   // template on the next turn's role header so the assistant doesn't leak
   // into a fake user turn. Escapes (\n, \t, etc.) are honored.
   const [stopText, setStopText] = useState<string>('<|start_header_id|>');
+  // Sampler/penalty knobs surfaced from the Advanced panel. Defaults match
+  // the SDK's defaults at src/index.tsx (the values engine.generate /
+  // engine.stream apply when the field is omitted). Stored as strings so
+  // partially-edited inputs don't immediately propagate NaN.
+  const [maxTokensText, setMaxTokensText] = useState<string>('256');
+  const [temperatureText, setTemperatureText] = useState<string>('0.8');
+  const [topKText, setTopKText] = useState<string>('40');
+  const [topPText, setTopPText] = useState<string>('0.95');
   const [repeatPenaltyText, setRepeatPenaltyText] = useState<string>('1.15');
+  const [repeatLastNText, setRepeatLastNText] = useState<string>('64');
+  const [frequencyPenaltyText, setFrequencyPenaltyText] = useState<string>('0');
+  const [presencePenaltyText, setPresencePenaltyText] = useState<string>('0');
   const [showAdvanced, setShowAdvanced] = useState(false);
   // When on, send() routes through `engine.chat.completions.create({
   // messages, stream: true })` instead of the renderBitnetPrompt + stream()
@@ -269,10 +293,14 @@ function AppContent() {
         .split(',')
         .map((s) => s.replace(/\\n/g, '\n').replace(/\\t/g, '\t').trim())
         .filter((s) => s.length > 0);
-      const repeatPenaltyValue = Number.parseFloat(repeatPenaltyText);
-      const repeatPenalty = Number.isFinite(repeatPenaltyValue)
-        ? repeatPenaltyValue
-        : 1.1;
+      const maxTokens = parseIntOr(maxTokensText, 256);
+      const temperature = parseFloatOr(temperatureText, 0.8);
+      const topK = parseIntOr(topKText, 40);
+      const topP = parseFloatOr(topPText, 0.95);
+      const repeatPenalty = parseFloatOr(repeatPenaltyText, 1.1);
+      const repeatLastN = parseIntOr(repeatLastNText, 64);
+      const frequencyPenalty = parseFloatOr(frequencyPenaltyText, 0);
+      const presencePenalty = parseFloatOr(presencePenaltyText, 0);
 
       if (useOpenAIApi) {
         // OpenAI-shape facade route. Same Engine instance, but the call
@@ -284,11 +312,16 @@ function AppContent() {
         // thing being verified here.
         const stream = await engine.chat.completions.create({
           messages: turns,
-          maxTokens: 256,
-          temperature: 0.8,
+          maxTokens,
+          temperature,
+          topK,
+          topP,
           seed: 0,
           stop: stopList,
           repeatPenalty,
+          repeatLastN,
+          frequencyPenalty,
+          presencePenalty,
           stream: true,
         });
         let lastFinishReason: ChatCompletionFinishReason = null;
@@ -324,11 +357,16 @@ function AppContent() {
         // by llama.cpp pattern-matching).
         const prompt = renderBitnetPrompt(turns);
         const stream = engine.stream(prompt, {
-          maxTokens: 256,
-          temperature: 0.8,
+          maxTokens,
+          temperature,
+          topK,
+          topP,
           seed: 0,
           stop: stopList,
           repeatPenalty,
+          repeatLastN,
+          frequencyPenalty,
+          presencePenalty,
         });
         for await (const chunk of stream) {
           appendToLastAssistant(chunk.delta);
@@ -357,7 +395,14 @@ function AppContent() {
     streaming,
     system,
     stopText,
+    maxTokensText,
+    temperatureText,
+    topKText,
+    topPText,
     repeatPenaltyText,
+    repeatLastNText,
+    frequencyPenaltyText,
+    presencePenaltyText,
     useOpenAIApi,
   ]);
 
@@ -457,17 +502,108 @@ function AppContent() {
             autoCapitalize="none"
             autoCorrect={false}
           />
-          <Text style={[styles.systemLabel, styles.advancedLabelGap]}>
-            Repeat penalty (1.0 = off, 1.1 default)
-          </Text>
-          <TextInput
-            style={styles.advancedInput}
-            defaultValue={repeatPenaltyText}
-            onEndEditing={(e) => setRepeatPenaltyText(e.nativeEvent.text)}
-            placeholder="1.15"
-            placeholderTextColor="#666"
-            keyboardType="decimal-pad"
-          />
+          <View style={styles.paramRow}>
+            <View style={styles.paramCell}>
+              <Text style={styles.systemLabel}>Max tokens</Text>
+              <TextInput
+                style={styles.advancedInput}
+                defaultValue={maxTokensText}
+                onEndEditing={(e) => setMaxTokensText(e.nativeEvent.text)}
+                placeholder="256"
+                placeholderTextColor="#666"
+                keyboardType="number-pad"
+              />
+            </View>
+            <View style={styles.paramCell}>
+              <Text style={styles.systemLabel}>Temperature</Text>
+              <TextInput
+                style={styles.advancedInput}
+                defaultValue={temperatureText}
+                onEndEditing={(e) => setTemperatureText(e.nativeEvent.text)}
+                placeholder="0.8"
+                placeholderTextColor="#666"
+                keyboardType="decimal-pad"
+              />
+            </View>
+          </View>
+
+          <View style={styles.paramRow}>
+            <View style={styles.paramCell}>
+              <Text style={styles.systemLabel}>Top-K</Text>
+              <TextInput
+                style={styles.advancedInput}
+                defaultValue={topKText}
+                onEndEditing={(e) => setTopKText(e.nativeEvent.text)}
+                placeholder="40"
+                placeholderTextColor="#666"
+                keyboardType="number-pad"
+              />
+            </View>
+            <View style={styles.paramCell}>
+              <Text style={styles.systemLabel}>Top-P</Text>
+              <TextInput
+                style={styles.advancedInput}
+                defaultValue={topPText}
+                onEndEditing={(e) => setTopPText(e.nativeEvent.text)}
+                placeholder="0.95"
+                placeholderTextColor="#666"
+                keyboardType="decimal-pad"
+              />
+            </View>
+          </View>
+
+          <View style={styles.paramRow}>
+            <View style={styles.paramCell}>
+              <Text style={styles.systemLabel}>Repeat penalty</Text>
+              <TextInput
+                style={styles.advancedInput}
+                defaultValue={repeatPenaltyText}
+                onEndEditing={(e) => setRepeatPenaltyText(e.nativeEvent.text)}
+                placeholder="1.15"
+                placeholderTextColor="#666"
+                keyboardType="decimal-pad"
+              />
+            </View>
+            <View style={styles.paramCell}>
+              <Text style={styles.systemLabel}>Repeat last N</Text>
+              <TextInput
+                style={styles.advancedInput}
+                defaultValue={repeatLastNText}
+                onEndEditing={(e) => setRepeatLastNText(e.nativeEvent.text)}
+                placeholder="64"
+                placeholderTextColor="#666"
+                keyboardType="number-pad"
+              />
+            </View>
+          </View>
+
+          <View style={styles.paramRow}>
+            <View style={styles.paramCell}>
+              <Text style={styles.systemLabel}>Frequency penalty</Text>
+              <TextInput
+                style={styles.advancedInput}
+                defaultValue={frequencyPenaltyText}
+                onEndEditing={(e) =>
+                  setFrequencyPenaltyText(e.nativeEvent.text)
+                }
+                placeholder="0"
+                placeholderTextColor="#666"
+                keyboardType="decimal-pad"
+              />
+            </View>
+            <View style={styles.paramCell}>
+              <Text style={styles.systemLabel}>Presence penalty</Text>
+              <TextInput
+                style={styles.advancedInput}
+                defaultValue={presencePenaltyText}
+                onEndEditing={(e) => setPresencePenaltyText(e.nativeEvent.text)}
+                placeholder="0"
+                placeholderTextColor="#666"
+                keyboardType="decimal-pad"
+              />
+            </View>
+          </View>
+
           <Pressable
             onPress={() => setUseOpenAIApi((v) => !v)}
             style={[styles.toggleRow, styles.advancedLabelGap]}
@@ -674,6 +810,8 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
   advancedLabelGap: { marginTop: 8 },
+  paramRow: { flexDirection: 'row', gap: 8, marginTop: 8 },
+  paramCell: { flex: 1 },
   toggleRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 10 },
   toggleBox: {
     width: 22,
