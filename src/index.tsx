@@ -28,6 +28,87 @@ function makeEngineBusyError(): Error & { code: string } {
   return err;
 }
 
+// Short opaque id for the synthetic `chatcmpl-…` field of the chat-completions
+// facade. Not crypto-strong; only for log correlation.
+function makeChatCompletionId(): string {
+  const r = () => Math.random().toString(36).slice(2, 8);
+  return `chatcmpl-${r()}${r()}`;
+}
+
+// Collapse our internal FinishReason → OpenAI's allowed set. 'cancelled' has
+// no OpenAI equivalent and maps to 'stop'.
+function finishReasonForOpenAI(r: FinishReason): ChatCompletionFinishReason {
+  if (r === 'length') return 'length';
+  return 'stop';
+}
+
+// Project a ChatCompletionCreateParams down to the GenerationParams subset
+// that engine.generate / engine.stream accept. (Just drops `messages` and
+// `stream`; everything else flows through 1:1.)
+function pickGenerationParams(p: ChatCompletionCreateParams): GenerationParams {
+  return {
+    maxTokens: p.maxTokens,
+    temperature: p.temperature,
+    topK: p.topK,
+    topP: p.topP,
+    seed: p.seed,
+    stop: p.stop,
+    repeatPenalty: p.repeatPenalty,
+    repeatLastN: p.repeatLastN,
+    frequencyPenalty: p.frequencyPenalty,
+    presencePenalty: p.presencePenalty,
+  };
+}
+
+// Wrap an Engine GenerationStream as an OpenAI-shaped chunk stream. First
+// chunk carries `delta.role: 'assistant'` (per OpenAI's protocol); middle
+// chunks carry `delta.content` only; the final chunk has an empty delta with
+// finish_reason set, matching what `await upstream.result` produces.
+function toOpenAIStream(
+  upstream: GenerationStream,
+  id: string,
+  created: number,
+  model: string
+): ChatCompletionStream {
+  const baseEnvelope = {
+    id,
+    object: 'chat.completion.chunk' as const,
+    created,
+    model,
+  };
+  return {
+    async *[Symbol.asyncIterator]() {
+      let first = true;
+      for await (const chunk of upstream) {
+        yield {
+          ...baseEnvelope,
+          choices: [
+            {
+              index: 0,
+              delta: first
+                ? { role: 'assistant' as const, content: chunk.delta }
+                : { content: chunk.delta },
+              finish_reason: null,
+            },
+          ],
+        };
+        first = false;
+      }
+      const result = await upstream.result;
+      yield {
+        ...baseEnvelope,
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: finishReasonForOpenAI(result.finishReason),
+          },
+        ],
+      };
+    },
+  };
+}
+
 export { Models };
 export type {
   ModelRef,
@@ -81,6 +162,74 @@ export type GenerationChunk = {
 export type GenerationStream = AsyncIterable<GenerationChunk> & {
   result: Promise<GenerationResult>;
 };
+
+// -----------------------------------------------------------------------------
+// OpenAI-shaped chat-completions facade types. The facade itself is built on
+// engine.generate / engine.stream — purely a JS-layer adapter. Params use this
+// SDK's camelCase convention; results mirror OpenAI's wire format
+// (snake_case sub-fields, `choices` array, `usage` totals) so destructuring
+// code copied from an OpenAI call site works unchanged.
+// -----------------------------------------------------------------------------
+
+export type ChatCompletionCreateParams = {
+  messages: ChatMessage[];
+  // Same names as GenerationParams (camelCase). `stream` selects the
+  // overload at the type level.
+  maxTokens?: number;
+  temperature?: number;
+  topK?: number;
+  topP?: number;
+  seed?: number;
+  stop?: string | string[];
+  repeatPenalty?: number;
+  repeatLastN?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+  stream?: boolean;
+};
+
+// Our internal FinishReason includes 'cancelled', which has no OpenAI
+// equivalent (OpenAI has no notion of user-initiated mid-stream cancel).
+// The facade collapses 'cancelled' → 'stop' for drop-in parity; callers who
+// need to distinguish cancel should use the lower-level engine.generate.
+export type ChatCompletionFinishReason = 'stop' | 'length' | null;
+
+export type ChatCompletionChoice = {
+  index: number;
+  message: { role: 'assistant'; content: string };
+  finish_reason: ChatCompletionFinishReason;
+};
+
+export type ChatCompletionUsage = {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+};
+
+export type ChatCompletion = {
+  id: string;
+  object: 'chat.completion';
+  created: number;
+  model: string;
+  choices: ChatCompletionChoice[];
+  usage: ChatCompletionUsage;
+};
+
+export type ChatCompletionChunkChoice = {
+  index: number;
+  delta: { role?: 'assistant'; content?: string };
+  finish_reason: ChatCompletionFinishReason;
+};
+
+export type ChatCompletionChunk = {
+  id: string;
+  object: 'chat.completion.chunk';
+  created: number;
+  model: string;
+  choices: ChatCompletionChunkChoice[];
+};
+
+export type ChatCompletionStream = AsyncIterable<ChatCompletionChunk>;
 
 export type GenerationParams = {
   maxTokens?: number;
@@ -352,6 +501,74 @@ export class Engine {
       this.busy = false;
       throw e;
     }
+  }
+
+  // OpenAI-shaped facade. Pure JS-layer adapter over applyChatTemplate +
+  // generate()/stream(); no native side involvement. Migrating callers can
+  // copy their existing OpenAI call site verbatim:
+  //
+  //   const r = await engine.chat.completions.create({ messages });
+  //   console.log(r.choices[0].message.content);
+  //
+  //   const s = await engine.chat.completions.create({ messages, stream: true });
+  //   for await (const c of s) ui.append(c.choices[0].delta.content ?? '');
+  //
+  // (Only param naming differs: this SDK uses camelCase — `maxTokens` instead
+  // of `max_tokens`. Result fields are snake_case to match OpenAI's wire
+  // format.)
+  get chat() {
+    type CreateFn = {
+      (
+        params: ChatCompletionCreateParams & { stream: true }
+      ): Promise<ChatCompletionStream>;
+      (
+        params: ChatCompletionCreateParams & { stream?: false }
+      ): Promise<ChatCompletion>;
+    };
+    // Arrow function so `this` (the Engine instance) is captured from the
+    // enclosing getter rather than rebound when called as
+    // `engine.chat.completions.create(...)`.
+    const create: CreateFn = (async (params: ChatCompletionCreateParams) => {
+      const id = makeChatCompletionId();
+      const created = Math.floor(Date.now() / 1000);
+      const info = await this.modelInfo();
+      const model = info.architecture;
+
+      // Render the chat using the model's GGUF tokenizer.chat_template.
+      // Throws E_NOT_TEMPLATABLE if the model has no recognized template;
+      // we let that propagate — fixing it is a model concern, not the
+      // facade's.
+      const prompt = await this.applyChatTemplate(params.messages, true);
+      const genParams = pickGenerationParams(params);
+
+      if (params.stream) {
+        const upstream = this.stream(prompt, genParams);
+        return toOpenAIStream(upstream, id, created, model);
+      }
+      const result = await this.generate(prompt, genParams);
+      return {
+        id,
+        object: 'chat.completion' as const,
+        created,
+        model,
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: 'assistant' as const,
+              content: result.text,
+            },
+            finish_reason: finishReasonForOpenAI(result.finishReason),
+          },
+        ],
+        usage: {
+          prompt_tokens: result.usage.promptTokens,
+          completion_tokens: result.usage.completionTokens,
+          total_tokens: result.usage.totalTokens,
+        },
+      };
+    }) as CreateFn;
+    return { completions: { create } };
   }
 
   cancel(): void {

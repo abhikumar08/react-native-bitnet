@@ -24,6 +24,7 @@ import {
 import {
   Engine,
   Models,
+  type ChatCompletionFinishReason,
   type ChatMessage,
   type DownloadProgress,
   type GenerationResult,
@@ -129,6 +130,13 @@ function AppContent() {
   const [stopText, setStopText] = useState<string>('<|start_header_id|>');
   const [repeatPenaltyText, setRepeatPenaltyText] = useState<string>('1.15');
   const [showAdvanced, setShowAdvanced] = useState(false);
+  // When on, send() routes through `engine.chat.completions.create({
+  // messages, stream: true })` instead of the renderBitnetPrompt + stream()
+  // path. Default off because BitNet b1.58's chat template isn't recognized
+  // by llama.cpp's pattern-matcher, so the facade path produces degenerate
+  // output for this specific model — but it's the correct path for any
+  // model whose GGUF metadata template IS recognized.
+  const [useOpenAIApi, setUseOpenAIApi] = useState(false);
   const [streaming, setStreaming] = useState(false);
   // Last completed generation's metadata — rendered as a one-liner under
   // the most recent assistant bubble so the new structured-result fields
@@ -257,38 +265,78 @@ function AppContent() {
         ...history,
         userMsg,
       ];
-      // BitNet b1.58 2B-4T ships a custom chat template in its GGUF metadata,
-      // but llama.cpp's pattern-matcher can't recognize the Jinja format and
-      // produces a broken approximation that the model interprets as OOD —
-      // generation degenerates to '@@@@@…'. We render the model's actual
-      // training format manually instead. See renderBitnetPrompt above for
-      // the full explanation. engine.applyChatTemplate() remains useful for
-      // models whose templates llama.cpp DOES recognize (chatml, llama3,
-      // mistral, etc.) — switch to that branch when loading those models.
-      const prompt = renderBitnetPrompt(turns);
       const stopList = stopText
         .split(',')
         .map((s) => s.replace(/\\n/g, '\n').replace(/\\t/g, '\t').trim())
         .filter((s) => s.length > 0);
-      const repeatPenalty = Number.parseFloat(repeatPenaltyText);
-      // Dogfood the async-iterator surface. The for-await loop is exactly
-      // what an OpenAI-API caller would write; tokens render incrementally
-      // via the same appendToLastAssistant. Tap Stop → engine.cancel() →
-      // stream loop exits naturally → stream.result resolves with
-      // finishReason: 'cancelled'.
-      const stream = engine.stream(prompt, {
-        maxTokens: 256,
-        temperature: 0.8,
-        seed: 0,
-        stop: stopList,
-        repeatPenalty: Number.isFinite(repeatPenalty) ? repeatPenalty : 1.1,
-      });
-      for await (const chunk of stream) {
-        appendToLastAssistant(chunk.delta);
+      const repeatPenaltyValue = Number.parseFloat(repeatPenaltyText);
+      const repeatPenalty = Number.isFinite(repeatPenaltyValue)
+        ? repeatPenaltyValue
+        : 1.1;
+
+      if (useOpenAIApi) {
+        // OpenAI-shape facade route. Same Engine instance, but the call
+        // shape is what a developer migrating from `openai.chat.completions
+        // .create({...})` would write. We let applyChatTemplate (inside
+        // the facade) render the prompt — for BitNet b1.58 that produces
+        // a degenerate output because llama.cpp can't pattern-match
+        // BitNet's custom template, but the OpenAI-shape envelope is the
+        // thing being verified here.
+        const stream = await engine.chat.completions.create({
+          messages: turns,
+          maxTokens: 256,
+          temperature: 0.8,
+          seed: 0,
+          stop: stopList,
+          repeatPenalty,
+          stream: true,
+        });
+        let lastFinishReason: ChatCompletionFinishReason = null;
+        let completionTokens = 0;
+        for await (const chunk of stream) {
+          const delta = chunk.choices[0]?.delta.content;
+          if (delta) {
+            appendToLastAssistant(delta);
+            completionTokens += 1;
+          }
+          if (chunk.choices[0]?.finish_reason) {
+            lastFinishReason = chunk.choices[0].finish_reason;
+          }
+        }
+        // The streaming chunks don't carry usage/timing — only the
+        // non-stream create() response does. Show what we know.
+        if (mountedRef.current) {
+          setLastResult({
+            text: '',
+            finishReason: lastFinishReason ?? 'stop',
+            usage: {
+              promptTokens: 0,
+              completionTokens,
+              totalTokens: completionTokens,
+            },
+            wallTimeMs: 0,
+          });
+        }
+        console.log('[generate-facade] finish_reason:', lastFinishReason);
+      } else {
+        // Direct engine.stream() route. Uses renderBitnetPrompt for the
+        // BitNet-specific format (its GGUF chat_template isn't supported
+        // by llama.cpp pattern-matching).
+        const prompt = renderBitnetPrompt(turns);
+        const stream = engine.stream(prompt, {
+          maxTokens: 256,
+          temperature: 0.8,
+          seed: 0,
+          stop: stopList,
+          repeatPenalty,
+        });
+        for await (const chunk of stream) {
+          appendToLastAssistant(chunk.delta);
+        }
+        const result = await stream.result;
+        if (mountedRef.current) setLastResult(result);
+        console.log('[generate]', JSON.stringify(result));
       }
-      const result = await stream.result;
-      if (mountedRef.current) setLastResult(result);
-      console.log('[generate]', JSON.stringify(result));
     } catch (e: unknown) {
       if (!cancelRequestedRef.current && mountedRef.current) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -310,6 +358,7 @@ function AppContent() {
     system,
     stopText,
     repeatPenaltyText,
+    useOpenAIApi,
   ]);
 
   const stop = useCallback(() => {
@@ -419,6 +468,25 @@ function AppContent() {
             placeholderTextColor="#666"
             keyboardType="decimal-pad"
           />
+          <Pressable
+            onPress={() => setUseOpenAIApi((v) => !v)}
+            style={[styles.toggleRow, styles.advancedLabelGap]}
+          >
+            <View
+              style={[styles.toggleBox, useOpenAIApi && styles.toggleBoxOn]}
+            >
+              {useOpenAIApi && <Text style={styles.toggleCheck}>✓</Text>}
+            </View>
+            <View style={styles.toggleLabelCol}>
+              <Text style={styles.toggleLabel}>OpenAI-style chat API</Text>
+              <Text style={styles.toggleHelper}>
+                Route send() through engine.chat.completions.create({'{'}…,
+                stream: true{'}'}). Default off; the bundled BitNet model gives
+                degenerate output via this path because llama.cpp can&apos;t
+                match its custom chat template.
+              </Text>
+            </View>
+          </Pressable>
         </View>
       )}
 
@@ -606,6 +674,23 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
   advancedLabelGap: { marginTop: 8 },
+  toggleRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 10 },
+  toggleBox: {
+    width: 22,
+    height: 22,
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: '#444',
+    backgroundColor: '#151515',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 2,
+  },
+  toggleBoxOn: { backgroundColor: '#2f6fbf', borderColor: '#2f6fbf' },
+  toggleCheck: { color: '#fff', fontSize: 14, lineHeight: 16 },
+  toggleLabelCol: { flex: 1 },
+  toggleLabel: { color: '#fff', fontSize: 13, fontWeight: '500' },
+  toggleHelper: { color: '#888', fontSize: 11, marginTop: 2, lineHeight: 15 },
   banner: {
     flexDirection: 'row',
     alignItems: 'center',

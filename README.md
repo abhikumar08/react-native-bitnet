@@ -158,6 +158,39 @@ for await (const chunk of engine.stream(prompt)) {
 resolves with `finishReason: 'cancelled'` and `text` containing whatever
 streamed before the break.
 
+#### Drop-in for OpenAI-API callers
+
+If you have existing code written against `openai.chat.completions.create(...)`,
+the same call shape works against an `Engine`. The result mirrors OpenAI's wire
+format (`choices`, `usage`, snake_case sub-fields) so response-handling code
+keeps working unchanged.
+
+```ts
+// Non-streaming.
+const response = await engine.chat.completions.create({
+	messages: [
+		{ role: 'system', content: 'You are helpful.' },
+		{ role: 'user', content: 'Hi' },
+	],
+	maxTokens: 256,
+});
+console.log(response.choices[0].message.content);
+console.log(response.usage.prompt_tokens, response.usage.completion_tokens);
+
+// Streaming.
+const stream = await engine.chat.completions.create({
+	messages: [{ role: 'user', content: 'Tell me a story' }],
+	stream: true,
+});
+for await (const chunk of stream) {
+	process.stdout.write(chunk.choices[0].delta.content ?? '');
+}
+```
+
+Param names follow this SDK's camelCase convention (`maxTokens`,
+`frequencyPenalty`, …); migrating call sites rename their param keys but the
+response destructuring stays identical to OpenAI code.
+
 ### 4. Use chat templates (recommended for chat models)
 
 `applyChatTemplate` renders model-specific prompt formatting from GGUF metadata.
@@ -250,6 +283,36 @@ Streaming generation as an async iterable. `GenerationParams` is the same as `en
 - Each yielded chunk has shape `{ delta: string }` — incremental text, never a partial multi-byte UTF-8 sequence.
 - `await stream.result` returns the same `GenerationResult` shape as `engine.generate`.
 - Breaking out of the loop (or calling `iterator.return()`) auto-invokes `engine.cancel()`. `.result` then resolves with `finishReason: 'cancelled'` and partial `text`.
+
+### `engine.chat.completions.create(params)`
+
+OpenAI-shaped facade over `applyChatTemplate` + `generate`/`stream`. Params use this SDK's camelCase (`maxTokens`, `frequencyPenalty`, etc.); the result mirrors OpenAI's wire format with snake_case sub-fields, a `choices` array, and a `usage` object.
+
+```ts
+type ChatCompletionCreateParams = {
+	messages: ChatMessage[];
+	maxTokens?: number;
+	temperature?: number;
+	topK?: number;
+	topP?: number;
+	seed?: number;
+	stop?: string | string[];
+	repeatPenalty?: number;
+	repeatLastN?: number;
+	frequencyPenalty?: number;
+	presencePenalty?: number;
+	stream?: boolean;
+};
+```
+
+Without `stream`, resolves to `ChatCompletion` (`{ id, object: 'chat.completion', created, model, choices: [{ index, message: { role, content }, finish_reason }], usage: { prompt_tokens, completion_tokens, total_tokens } }`).
+
+With `stream: true`, resolves to an `AsyncIterable<ChatCompletionChunk>`. First chunk carries `delta.role: 'assistant'`; middle chunks carry only `delta.content`; the final chunk has an empty delta and `finish_reason` set.
+
+Caveats:
+
+- `'cancelled'` finish reasons from the underlying engine map to `'stop'` in the facade for OpenAI parity. Callers who need to distinguish cancellation should use the lower-level `engine.generate` / `engine.stream`.
+- Requires the loaded GGUF to ship a `tokenizer.chat_template` that llama.cpp recognizes (chatml, llama2, llama3, mistral, gemma, qwen, etc.). Models with no template or with a custom Jinja string the pattern-matcher can't decode will throw — render the prompt manually and use `engine.generate` instead.
 
 ### `engine.cancel(): void`
 
