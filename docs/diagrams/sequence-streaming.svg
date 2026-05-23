@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="680" viewBox="0 0 680 820" role="img" aria-labelledby="title desc">
-  <title id="title">End-to-end sequence: demo prompt to streamed tokens</title>
-  <desc id="desc">Six vertical lifelines: chat UI, public TS Engine, Kotlin BitnetModule, JNI bridge, C++ BitnetEngine, llama.cpp. Three phases top to bottom: apply chat template (synchronous downcall), generate (streaming loop with tokens bubbling up), EOS (promise resolves).</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="720" viewBox="0 0 720 900" role="img" aria-labelledby="title desc">
+  <title id="title">Streaming sequence: prompt to streamed tokens to completion</title>
+  <desc id="desc">Six lifelines top to bottom: caller code, public TS Engine (or stream or chat.completions facade), Kotlin BitnetModule, JNI bridge, C++ BitnetEngine, llama.cpp. Three phases: pre-call validation (already-aborted signal rejects synchronously), the streaming loop where tokens bubble up through emitToken to DeviceEventEmitter to the JS listener, and completion which forks into three outcomes — natural end, engine.cancel resolves with partial text, or AbortSignal rejects with AbortError.</desc>
   <style>
     .title { font: 500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     .sub   { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -10,14 +10,18 @@
     .teal-title { fill: #04342C; }
     .coral { fill: #FAECE7; stroke: #993C1D; stroke-width: 0.5; }
     .coral-title { fill: #4A1B0C; }
-    .lifeline { stroke: #888780; stroke-width: 0.5; stroke-dasharray: 3 3; opacity: 0.5; }
+    .lifeline   { stroke: #888780; stroke-width: 0.5; stroke-dasharray: 3 3; opacity: 0.5; }
     .arrow      { stroke: #444441; stroke-width: 1.5; fill: none; }
     .arrow-back { stroke: #5F5E5A; stroke-width: 0.5; stroke-dasharray: 4 4; fill: none; }
-    .label  { fill: #2C2C2A; }
+    .arrow-err  { stroke: #993C1D; stroke-width: 1.5; fill: none; }
+    .label      { fill: #2C2C2A; }
     .label-back { fill: #5F5E5A; }
+    .label-err  { fill: #993C1D; font-weight: 500; }
     .phase-rule { stroke: #B4B2A9; stroke-width: 0.5; opacity: 0.5; }
     .phase-lbl  { fill: #5F5E5A; font: 500 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     .loop-box   { stroke: #888780; stroke-width: 0.5; stroke-dasharray: 3 3; opacity: 0.5; fill: none; }
+    .alt-box    { stroke: #993C1D; stroke-width: 0.5; stroke-dasharray: 3 3; opacity: 0.5; fill: none; }
+    .alt-lbl    { fill: #993C1D; font-style: italic; }
     .loop-lbl   { fill: #5F5E5A; font-style: italic; }
   </style>
   <defs>
@@ -26,102 +30,116 @@
     </marker>
   </defs>
 
-  <!-- Lifeline header boxes -->
+  <!-- Lifeline headers — 6 columns, evenly spaced -->
   <rect class="gray"  x="20"  y="20" width="100" height="36" rx="6"/>
-  <text class="title gray-title"  x="70"  y="38" text-anchor="middle" dominant-baseline="central">Chat UI</text>
-  <rect class="teal"  x="130" y="20" width="100" height="36" rx="6"/>
-  <text class="title teal-title"  x="180" y="38" text-anchor="middle" dominant-baseline="central">Engine (TS)</text>
-  <rect class="teal"  x="240" y="20" width="100" height="36" rx="6"/>
-  <text class="title teal-title"  x="290" y="38" text-anchor="middle" dominant-baseline="central">BitnetModule</text>
-  <rect class="coral" x="350" y="20" width="100" height="36" rx="6"/>
-  <text class="title coral-title" x="400" y="38" text-anchor="middle" dominant-baseline="central">JNI bridge</text>
-  <rect class="coral" x="460" y="20" width="100" height="36" rx="6"/>
-  <text class="title coral-title" x="510" y="38" text-anchor="middle" dominant-baseline="central">BitnetEngine</text>
-  <rect class="gray"  x="570" y="20" width="90"  height="36" rx="6"/>
-  <text class="title gray-title"  x="615" y="38" text-anchor="middle" dominant-baseline="central">llama.cpp</text>
+  <text class="title gray-title"  x="70"  y="38" text-anchor="middle" dominant-baseline="central">Caller</text>
+  <rect class="teal"  x="135" y="20" width="110" height="36" rx="6"/>
+  <text class="title teal-title"  x="190" y="38" text-anchor="middle" dominant-baseline="central">Engine · stream</text>
+  <rect class="teal"  x="260" y="20" width="110" height="36" rx="6"/>
+  <text class="title teal-title"  x="315" y="38" text-anchor="middle" dominant-baseline="central">BitnetModule</text>
+  <rect class="coral" x="385" y="20" width="100" height="36" rx="6"/>
+  <text class="title coral-title" x="435" y="38" text-anchor="middle" dominant-baseline="central">JNI bridge</text>
+  <rect class="coral" x="500" y="20" width="110" height="36" rx="6"/>
+  <text class="title coral-title" x="555" y="38" text-anchor="middle" dominant-baseline="central">BitnetEngine</text>
+  <rect class="gray"  x="625" y="20" width="80"  height="36" rx="6"/>
+  <text class="title gray-title"  x="665" y="38" text-anchor="middle" dominant-baseline="central">llama.cpp</text>
 
   <!-- Lifelines -->
-  <line class="lifeline" x1="70"  y1="56" x2="70"  y2="780"/>
-  <line class="lifeline" x1="180" y1="56" x2="180" y2="780"/>
-  <line class="lifeline" x1="290" y1="56" x2="290" y2="780"/>
-  <line class="lifeline" x1="400" y1="56" x2="400" y2="780"/>
-  <line class="lifeline" x1="510" y1="56" x2="510" y2="780"/>
-  <line class="lifeline" x1="615" y1="56" x2="615" y2="780"/>
+  <line class="lifeline" x1="70"  y1="56" x2="70"  y2="870"/>
+  <line class="lifeline" x1="190" y1="56" x2="190" y2="870"/>
+  <line class="lifeline" x1="315" y1="56" x2="315" y2="870"/>
+  <line class="lifeline" x1="435" y1="56" x2="435" y2="870"/>
+  <line class="lifeline" x1="555" y1="56" x2="555" y2="870"/>
+  <line class="lifeline" x1="665" y1="56" x2="665" y2="870"/>
 
-  <!-- Phase 1: apply chat template -->
-  <text class="sub label" x="20" y="84">User taps send</text>
+  <!-- ===================== Phase 1: pre-call =====================  -->
+  <text class="phase-lbl" x="20" y="82">pre-call</text>
 
-  <line class="arrow" x1="70" y1="96" x2="178" y2="96" marker-end="url(#arrowhead)"/>
-  <text class="sub label" x="74" y="92">applyChatTemplate(messages)</text>
+  <!-- Already-aborted signal fast path -->
+  <rect class="alt-box" x="135" y="92" width="120" height="60" rx="6"/>
+  <text class="sub alt-lbl" x="142" y="108">opt — signal.aborted</text>
+  <line class="arrow-err" x1="188" y1="125" x2="72" y2="125" marker-end="url(#arrowhead)"/>
+  <text class="sub label-err" x="80" y="121">throws AbortError synchronously</text>
+  <text class="sub label" x="142" y="146">no native call</text>
 
-  <line class="arrow" x1="180" y1="118" x2="288" y2="118" marker-end="url(#arrowhead)"/>
-  <text class="sub label" x="184" y="114">JSON.stringify(roles)</text>
+  <!-- Normal entry -->
+  <line class="arrow" x1="70" y1="174" x2="188" y2="174" marker-end="url(#arrowhead)"/>
+  <text class="sub label" x="74" y="170">stream(prompt, { signal })</text>
 
-  <line class="arrow" x1="290" y1="140" x2="398" y2="140" marker-end="url(#arrowhead)"/>
-  <text class="sub label" x="294" y="136">nativeApplyChatTemplate</text>
+  <!-- Engine: register signal listener, attach BitnetToken listener -->
+  <text class="sub label" x="135" y="194">signal.addEventListener('abort', …)</text>
+  <text class="sub label" x="135" y="210">add 'BitnetToken' listener</text>
 
-  <line class="arrow" x1="400" y1="162" x2="508" y2="162" marker-end="url(#arrowhead)"/>
-  <text class="sub label" x="404" y="158">parse · build prompt</text>
+  <line class="arrow" x1="190" y1="232" x2="313" y2="232" marker-end="url(#arrowhead)"/>
+  <text class="sub label" x="194" y="228">nativeGenerate(handle, requestId, params)</text>
 
-  <line class="arrow-back" x1="510" y1="184" x2="398" y2="184" marker-end="url(#arrowhead)"/>
-  <text class="sub label-back" x="404" y="180">templated prompt string</text>
+  <!-- Single-flight gate check -->
+  <rect class="alt-box" x="260" y="246" width="200" height="44" rx="6"/>
+  <text class="sub alt-lbl" x="268" y="262">alt — gate held by another call</text>
+  <line class="arrow-err" x1="313" y1="280" x2="192" y2="280" marker-end="url(#arrowhead)"/>
+  <text class="sub label-err" x="200" y="276">rejects with E_ENGINE_BUSY</text>
 
-  <line class="arrow-back" x1="400" y1="206" x2="292" y2="206" marker-end="url(#arrowhead)"/>
-  <line class="arrow-back" x1="290" y1="228" x2="182" y2="228" marker-end="url(#arrowhead)"/>
-  <line class="arrow-back" x1="180" y1="250" x2="72"  y2="250" marker-end="url(#arrowhead)"/>
+  <text class="sub label" x="260" y="306">acquire single-flight gate</text>
+  <line class="arrow" x1="315" y1="324" x2="433" y2="324" marker-end="url(#arrowhead)"/>
+  <text class="sub label" x="319" y="320">spawn worker thread · JNI call</text>
 
-  <!-- Phase 2: generate -->
-  <line class="phase-rule" x1="20" y1="282" x2="660" y2="282"/>
-  <text class="phase-lbl"  x="20" y="300">generate · async</text>
+  <line class="arrow" x1="435" y1="346" x2="553" y2="346" marker-end="url(#arrowhead)"/>
+  <text class="sub label" x="439" y="342">engine→generate(cb)</text>
 
-  <line class="arrow" x1="70" y1="312" x2="178" y2="312" marker-end="url(#arrowhead)"/>
-  <text class="sub label" x="74" y="308">engine.generate(prompt, onToken)</text>
+  <!-- ===================== Phase 2: streaming loop ===================== -->
+  <line class="phase-rule" x1="20" y1="376" x2="700" y2="376"/>
+  <text class="phase-lbl"  x="20" y="394">streaming · async</text>
 
-  <line class="arrow" x1="180" y1="334" x2="288" y2="334" marker-end="url(#arrowhead)"/>
-  <text class="sub label" x="184" y="330">nativeGenerate(handle, params)</text>
+  <!-- Loop frame -->
+  <rect class="loop-box" x="380" y="406" width="320" height="206" rx="6"/>
+  <text class="sub loop-lbl" x="390" y="424">loop — per token until EOS / cancel / abort</text>
 
-  <text class="sub label" x="180" y="358">addListener('BitnetToken')</text>
+  <line class="arrow" x1="555" y1="446" x2="663" y2="446" marker-end="url(#arrowhead)"/>
+  <text class="sub label" x="559" y="442">llama_decode · sample</text>
 
-  <line class="arrow" x1="290" y1="378" x2="398" y2="378" marker-end="url(#arrowhead)"/>
-  <text class="sub label" x="294" y="374">spawn worker thread</text>
+  <line class="arrow-back" x1="665" y1="468" x2="557" y2="468" marker-end="url(#arrowhead)"/>
+  <text class="sub label-back" x="559" y="464">token id · piece (UTF-8 safe)</text>
 
-  <line class="arrow" x1="400" y1="400" x2="508" y2="400" marker-end="url(#arrowhead)"/>
-  <text class="sub label" x="404" y="396">engine-&gt;generate(cb)</text>
+  <line class="arrow" x1="553" y1="490" x2="437" y2="490" marker-end="url(#arrowhead)"/>
+  <text class="sub label" x="335" y="486">cb(piece, requestId)</text>
 
-  <!-- Streaming loop frame -->
-  <rect class="loop-box" x="430" y="426" width="240" height="240" rx="6"/>
-  <text class="sub loop-lbl" x="440" y="444">loop · per token until EOS</text>
+  <line class="arrow" x1="433" y1="512" x2="317" y2="512" marker-end="url(#arrowhead)"/>
+  <text class="sub label" x="215" y="508">emitToken via NewString (UTF-16, emoji-safe)</text>
 
-  <line class="arrow" x1="510" y1="466" x2="613" y2="466" marker-end="url(#arrowhead)"/>
-  <text class="sub label" x="514" y="462">llama_decode · sample</text>
+  <line class="arrow" x1="313" y1="534" x2="192" y2="534" marker-end="url(#arrowhead)"/>
+  <text class="sub label" x="135" y="530">DeviceEventEmitter('BitnetToken')</text>
 
-  <line class="arrow-back" x1="615" y1="488" x2="512" y2="488" marker-end="url(#arrowhead)"/>
-  <text class="sub label-back" x="514" y="484">token id · detokenized piece</text>
+  <line class="arrow" x1="188" y1="556" x2="72" y2="556" marker-end="url(#arrowhead)"/>
+  <text class="sub label" x="80" y="552">yield chunk · or onToken(delta)</text>
 
-  <line class="arrow" x1="508" y1="510" x2="402" y2="510" marker-end="url(#arrowhead)"/>
-  <text class="sub label" x="404" y="506">onToken(piece)</text>
+  <text class="sub loop-lbl" x="390" y="586">next iteration unless flag set</text>
+  <line class="arrow" x1="555" y1="600" x2="663" y2="600" marker-end="url(#arrowhead)" opacity="0.55"/>
 
-  <line class="arrow" x1="398" y1="532" x2="292" y2="532" marker-end="url(#arrowhead)"/>
-  <text class="sub label" x="294" y="528">emitToken(env, piece)</text>
+  <!-- ===================== Phase 3: completion, three outcomes ===================== -->
+  <line class="phase-rule" x1="20" y1="636" x2="700" y2="636"/>
+  <text class="phase-lbl"  x="20" y="654">completion · three outcomes</text>
 
-  <line class="arrow" x1="288" y1="554" x2="182" y2="554" marker-end="url(#arrowhead)"/>
-  <text class="sub label" x="184" y="550">DeviceEventEmitter</text>
+  <!-- Outcome A: natural EOS -->
+  <rect class="loop-box" x="20" y="668" width="680" height="56" rx="6"/>
+  <text class="sub loop-lbl" x="30" y="685">A — natural EOS reached</text>
+  <line class="arrow-back" x1="555" y1="706" x2="437" y2="706" marker-end="url(#arrowhead)"/>
+  <text class="sub label-back" x="335" y="702">stats · finishReason: 'stop'</text>
+  <line class="arrow-back" x1="190" y1="720" x2="72" y2="720" marker-end="url(#arrowhead)"/>
+  <text class="sub label-back" x="195" y="716">.result resolves · listener removed</text>
 
-  <line class="arrow" x1="178" y1="576" x2="72" y2="576" marker-end="url(#arrowhead)"/>
-  <text class="sub label" x="74" y="572">listener fires · onToken</text>
+  <!-- Outcome B: engine.cancel() resolves -->
+  <rect class="loop-box" x="20" y="738" width="680" height="60" rx="6"/>
+  <text class="sub loop-lbl" x="30" y="755">B — engine.cancel() or stream consumer breaks</text>
+  <line class="arrow" x1="72" y1="775" x2="188" y2="775" marker-end="url(#arrowhead)"/>
+  <text class="sub label" x="80" y="771">engine.cancel() · flips atomic flag in registry</text>
+  <line class="arrow-back" x1="190" y1="794" x2="72" y2="794" marker-end="url(#arrowhead)"/>
+  <text class="sub label-back" x="195" y="790">.result resolves · finishReason: 'cancelled' · partial text</text>
 
-  <text class="sub label" x="20" y="598">setState · append piece</text>
-
-  <text class="sub loop-lbl" x="440" y="640">next iteration · llama_decode</text>
-  <line class="arrow" x1="510" y1="652" x2="613" y2="652" marker-end="url(#arrowhead)" opacity="0.6"/>
-
-  <!-- Phase 3: EOS -->
-  <line class="phase-rule" x1="20" y1="690" x2="660" y2="690"/>
-  <text class="phase-lbl"  x="20" y="708">EOS reached</text>
-
-  <line class="arrow-back" x1="510" y1="720" x2="402" y2="720" marker-end="url(#arrowhead)"/>
-  <text class="sub label-back" x="404" y="716">stats · final text</text>
-  <line class="arrow-back" x1="400" y1="742" x2="292" y2="742" marker-end="url(#arrowhead)"/>
-  <line class="arrow-back" x1="290" y1="764" x2="182" y2="764" marker-end="url(#arrowhead)"/>
-  <text class="sub label-back" x="184" y="760">resolve Promise · remove listener</text>
+  <!-- Outcome C: AbortSignal rejects -->
+  <rect class="alt-box" x="20" y="812" width="680" height="56" rx="6"/>
+  <text class="sub alt-lbl" x="30" y="829">C — AbortSignal aborts mid-stream</text>
+  <line class="arrow-err" x1="72" y1="848" x2="188" y2="848" marker-end="url(#arrowhead)"/>
+  <text class="sub label-err" x="80" y="844">signal fires · engine.cancel() invoked internally</text>
+  <line class="arrow-err" x1="190" y1="866" x2="72" y2="866" marker-end="url(#arrowhead)"/>
+  <text class="sub label-err" x="195" y="862">iterator throws · .result rejects with AbortError</text>
 </svg>
