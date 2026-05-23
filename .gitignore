@@ -84,3 +84,8 @@ android/generated
 
 # React Native Nitro Modules
 nitrogen/
+
+# Local-only prebuilt rebuild helper — depends on a BitNet checkout that lives
+# outside this repo, so it's machine-specific. The documented process is in
+# .claude/skills/build-native-prebuilts/SKILL.md.
+scripts/rebuild-android-prebuilts.sh
