@@ -13,6 +13,38 @@ The library does not build llama.cpp from source at consumer-app build time. We 
 
 The matching headers are checked into [android/src/main/cpp/include/{llama,common,ggml}/](../../../android/src/main/cpp/include/). **Bump these in lockstep** — header/library skew is the most common reason for a subtle UB after upgrading.
 
+## ⚠️ ARM NEON i2_s regression — current prebuilts pin a pre-`112f853` kernel
+
+The shipped arm64 prebuilts are **not** built from BitNet `HEAD`. BitNet commit
+`112f853` ("parallel I2S kernels") rewrote the ARM NEON i2_s kernel and made it
+numerically wrong on CPU — every chat produces `@@@` garbage on-device. Only the
+x86 AVX path and the Metal GPU kernel stayed correct, and Android is CPU-only
+(no Metal), so it always hit the broken path. Upstream tracking:
+<https://github.com/microsoft/BitNet/issues/470> (open, no fix yet).
+
+Confirmed by isolation: f32 weights decode correctly on arm64 CPU, i2_s does not;
+x86 AVX i2_s (under Rosetta) is correct; a NEON-self-quantized round-trip still
+fails — so the NEON i2_s kernel is intrinsically broken, not a layout mismatch.
+NDK/clang version, BLAS, and llamafile were all ruled out.
+
+Until upstream ships a fix, build with the i2_s subsystem reverted to the
+last-known-good pre-`112f853` state:
+
+```sh
+git -C <bitnet> checkout 404980e -- src/ggml-bitnet-mad.cpp    # 362-line pre-rewrite kernel
+git -C <bitnet>/3rdparty/llama.cpp checkout 40ed0f2            # pre-112f853 submodule pin
+```
+
+Both share the same `b3639` base and the public `llama.h` / `ggml.h` are unchanged
+between the pins, so `bitnet_engine.cpp` and the JNI surface compile unmodified —
+no header bump is needed for this particular revert. Trade-off: this forgoes
+`112f853`'s parallel-kernel speedup (correctness first). The forward-fix path is
+to port the correct x86 AVX i2_s logic to NEON.
+
+A local-only helper that does the revert + build + verify + copy lives at
+`scripts/rebuild-android-prebuilts.sh` (gitignored — it points at a BitNet
+checkout outside this repo).
+
 ## When to rebuild
 
 - Bumping the upstream `llama.cpp` / `bitnet.cpp` SHA.
@@ -132,6 +164,7 @@ Verified: yarn example android, verify-streaming smoke
 - **Static `libcommon` vs shared.** [CMakeLists.txt](../../../android/CMakeLists.txt) imports `libcommon` as `STATIC IMPORTED`. If upstream switches it to shared (`.so`), the import declaration needs updating too.
 - **Symbol visibility on the library side.** If `libllama.so` was built with `-fvisibility=hidden` upstream (some forks), llama symbols aren't dlopen-able. Patch upstream's `CMakeLists.txt` to remove that flag if encountered.
 - **STL mismatch.** Building llama.cpp with `c++_static` and linking against a `c++_shared` consumer (which `bitnet_rn` uses) "works" until the first std::string crosses the boundary, then crashes in a destructor with no useful stack.
+- **16 KB page size.** Recent devices/emulators (`sdk_gphone16k_arm64`, Pixel on Android 15+) use 16 KB memory pages. NDK r27 defaults to 4 KB segment alignment, which **segfaults on load** there. Link the `.so`s with `-Wl,-z,max-page-size=16384` (`CMAKE_SHARED_LINKER_FLAGS` + `CMAKE_EXE_LINKER_FLAGS`). Verify: `llvm-readelf -l libggml.so | grep LOAD` should show `0x4000`, not `0x1000`.
 
 ## Companion skill
 
