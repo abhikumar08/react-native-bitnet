@@ -150,7 +150,7 @@ Breaking out of the loop auto-cancels the underlying generation:
 
 ```ts
 for await (const chunk of engine.stream(prompt)) {
-	if (chunk.delta.includes('STOP')) break;  // engine.cancel() fires here
+	if (chunk.delta.includes('STOP')) break;  // iterator.return() fires NativeBitnet.cancelGeneration(handle) directly
 }
 ```
 
@@ -425,11 +425,11 @@ The SDK doesn't store the token — bring your own secure storage (e.g. `react-n
 
 See `example/src/App.tsx` for an end-to-end sample that:
 
-- Loads a model
-- Calls `modelInfo()`
-- Streams tokens with `onToken`
-- Reads final output from `generate`
-- Disposes engine
+- Downloads a model via `Models.download('hf://...')`
+- Loads it with `Engine.load({ modelPath })`
+- Streams tokens via `engine.chat.completions.create({ stream: true })` and `engine.stream()` (`for await` loop)
+- Reads final text and usage from `stream.result`
+- Disposes engine on unmount
 
 ## Contributing
 

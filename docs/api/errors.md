@@ -106,6 +106,62 @@ try {
 }
 ```
 
+### `E_LOAD_FAILED`
+
+The native side failed to load the model — either `loadModel` returned a null handle or threw (corrupt/incompatible GGUF, out of memory, unreadable file). Distinct from the download/cache errors below: the file was present, but the engine couldn't initialize from it.
+
+**Thrown by:** [`Engine.load`](./engine.md#engineloadconfig) (after any download step succeeds).
+
+**Shape:**
+
+```ts
+Error & { code: 'E_LOAD_FAILED' }
+```
+
+**Recovery:** verify the GGUF is a supported BitNet/llama.cpp quantization and not truncated. Re-download with a checksum (`downloadOptions.expectedSha256`) if corruption is suspected.
+
+### `E_GEN_FAILED`
+
+The native `generate()` decode threw unexpectedly (not a cancel, not an abort — an actual engine fault mid-decode).
+
+**Thrown by:** [`engine.generate`](./engine.md#enginegenerateprompt-params), [`engine.stream`](./engine.md#enginestreamprompt-params), and transitively [`engine.chat.completions.create`](./chat-completions.md).
+
+**Shape:**
+
+```ts
+Error & { code: 'E_GEN_FAILED' }
+```
+
+**Recovery:** none automatic — surface to the user. A recurring `E_GEN_FAILED` on a model that previously worked usually points to a corrupted KV cache state; dispose and reload the engine.
+
+### `E_TEMPLATE_FAILED`
+
+The native `applyChatTemplate()` threw. Distinct from [`E_NOT_TEMPLATABLE`](#e_not_templatable): the model *has* a chat template, but rendering it failed (malformed template metadata, unexpected message shape).
+
+**Thrown by:** [`engine.applyChatTemplate`](./engine.md#engineapplychattemplatemessages-addassistantheader), and transitively [`engine.chat.completions.create`](./chat-completions.md).
+
+**Shape:**
+
+```ts
+Error & { code: 'E_TEMPLATE_FAILED' }
+```
+
+**Recovery:** fall back to rendering the prompt manually and calling `engine.generate` / `engine.stream`.
+
+### `E_INFO_FAILED`
+
+The native `getModelInfo()` threw while reading GGUF metadata.
+
+**Thrown by:** [`engine.modelInfo`](./engine.md#enginemodelinfo).
+
+**Shape:**
+
+```ts
+Error & { code: 'E_INFO_FAILED' }
+```
+
+**Recovery:** none automatic — the engine is still usable for generation even if metadata can't be read.
+
 ## Download / cache errors
 
 ### `E_INVALID_REF`
@@ -194,6 +250,24 @@ Internal code raised when the native downloader is cancelled. The SDK converts t
 
 **JS-facing shape:** see [`AbortError`](#aborterror).
 
+### `E_CACHE`
+
+A cache filesystem operation threw — listing, deleting, sizing, resolving the cache dir, or checking whether a ref is cached. Fires on both Android and iOS (the lifecycle layer is implemented on both platforms).
+
+**Thrown by:** [`Models.list`](./models.md#modelslist), [`Models.delete`](./models.md#modelsdeleteref), [`Models.cacheSize`](./models.md#modelscachesize), [`Models.cacheDir`](./models.md#modelscachedir), [`Models.isCached`](./models.md#modelsiscachedref).
+
+**Shape:**
+
+```ts
+Error & { code: 'E_CACHE' }
+```
+
+**Recovery:** usually a transient or permissions issue on the app's private storage. Retry once; if it persists, the cache directory may be unreadable.
+
+### `E_INTERRUPTED` (not a thrown error)
+
+Unlike the codes above, `E_INTERRUPTED` is **never thrown or rejected** — it is a sentinel value written to the `lastError` field of an incomplete [`CachedModelEntry`](./types.md#cachedmodelentry) when a download is cut short by process death. The crash-recovery sweep on module init marks such entries so the UI can present a resumable state. You only ever read it off `Models.list()` results, never `catch` it.
+
 ## Generic errors
 
 ### `AbortError`
@@ -236,6 +310,6 @@ These will be promoted to `E_INVALID_CONFIG` (with `.code`) in a future release.
 
 ## Error code parity across platforms
 
-Every code in this catalog should fire on both Android and iOS with the same trigger condition. The exception today is `E_NOT_IMPLEMENTED`, which iOS uses as a placeholder for the in-progress engine port. Once the port lands, that code will no longer fire from `Engine` methods on either platform.
+Every code in this catalog should fire on both Android and iOS with the same trigger condition. The exception today is `E_NOT_IMPLEMENTED`, which iOS uses as a placeholder for the in-progress engine port. Because iOS short-circuits the engine methods with `E_NOT_IMPLEMENTED`, the engine-side native failures (`E_LOAD_FAILED`, `E_GEN_FAILED`, `E_TEMPLATE_FAILED`, `E_INFO_FAILED`) are Android-only today — they only become reachable on iOS once the port lands. The cache codes (`E_CACHE`, the download codes) already fire on both platforms.
 
 If you observe a code firing on one platform but not the other for the same trigger, it's a bug — please file it.

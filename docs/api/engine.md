@@ -216,7 +216,7 @@ Same as [`engine.generate`](#enginegenerateprompt-params) except `onToken` is ig
 ### Termination behavior
 
 - **Loop completes naturally:** `stream.result` resolves with `finishReason: 'length'` or `'stop'`.
-- **`break` out of the loop** (or call `iterator.return()`): SDK auto-invokes `engine.cancel()`. `stream.result` resolves with `finishReason: 'cancelled'` and partial `text`.
+- **`break` out of the loop** (or call `iterator.return()`): SDK calls `NativeBitnet.cancelGeneration(handle)` directly (not `engine.cancel()`, so no `throwIfDisposed()` guard runs). `stream.result` resolves with `finishReason: 'cancelled'` and partial `text`.
 - **`signal` aborts:** parked `next()` calls and `stream.result` reject with [`AbortError`](./errors.md#aborterror).
 
 ### Throws
@@ -295,7 +295,7 @@ console.log(response.choices[0].message.content);
 
 ## `engine.cancel()`
 
-Cancels an in-flight generation. **Idempotent** — safe to call when nothing is in flight.
+Cancels an in-flight generation. **No-op when no generation is in flight** — but it still rejects with `E_ENGINE_DISPOSED` on a disposed engine (see Throws below).
 
 ### Signature
 

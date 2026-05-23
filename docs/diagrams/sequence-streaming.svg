@@ -71,7 +71,7 @@
   <text class="sub label" x="135" y="210">add 'BitnetToken' listener</text>
 
   <line class="arrow" x1="190" y1="232" x2="313" y2="232" marker-end="url(#arrowhead)"/>
-  <text class="sub label" x="194" y="228">nativeGenerate(handle, requestId, params)</text>
+  <text class="sub label" x="194" y="228">generate(handle, requestId, params)</text>
 
   <!-- Single-flight gate check -->
   <rect class="alt-box" x="260" y="246" width="200" height="44" rx="6"/>

@@ -19,7 +19,7 @@ Yarn workspaces monorepo. The library is the root package; `example/` is a works
   - `src/main/jniLibs/arm64-v8a/` — prebuilt `libllama.so`, `libggml.so`, `libcommon.a`. **arm64 only** (see `abiFilters "arm64-v8a"` in `android/build.gradle` — ADR-001 referenced in comments).
   - `CMakeLists.txt` — `bitnet_rn` shared lib links the three prebuilts. `CXX_VISIBILITY_PRESET default` is intentional: NDK's default-hidden visibility strips `JNIEXPORT` symbols from the dynamic table, breaking `dlsym()` resolution.
 - `ios/` — `Bitnet.mm` has the model-lifecycle methods wired (delegating to `BitnetDownloader`/`BitnetCache`), but the inference engine methods are still `E_NOT_IMPLEMENTED` stubs. The C++ engine in `android/src/main/cpp/bitnet_engine.{h,cpp}` is intentionally platform-agnostic and can be reused unchanged when the iOS port lands.
-- `example/` — RN host app. `example/src/App.tsx` loads a model from `/data/data/bitnet.example/files/model.gguf` and logs streaming tokens to an on-screen ScrollView (also `console.log`'d to logcat).
+- `example/` — RN host app. `example/src/App.tsx` downloads a model via `Models.download('hf://microsoft/bitnet-b1.58-2B-4T-gguf/ggml-model-i2_s.gguf')` and then calls `Engine.load({ modelPath: entry.localPath })`. Streamed tokens are rendered to an on-screen ScrollView (also `console.log`'d to logcat).
 
 ## Commands
 
@@ -55,18 +55,18 @@ To confirm the New Architecture is active, look for `"fabric":true,"concurrentRo
 - Kotlin: `Double` at the spec boundary (TurboModule numeric type), converted to `Long` before JNI.
 - C++: `jlong` key in `EngineRegistry` (the singleton in `bitnet_jni.cpp`), NOT a reinterpret-cast pointer. Dispose removes the entry from the registry, which destroys the `unique_ptr<BitnetEngine>`.
 
-**Token streaming.** `BitnetEngine::generate()` takes a `TokenCallback` (`std::function<CallbackResult(const std::string&)>`). The JNI layer calls back into Kotlin's `emitToken(handle, token)`, which fires a `BitnetToken` JS event via `DeviceEventManagerModule.RCTDeviceEventEmitter`. The JS `Engine.generate()` filters events by `event.handle === this.handle` so multiple concurrent engines don't cross-talk. On iOS, `NativeEventEmitter` requires the module to implement `supportedEvents`/`addListener`/`removeListeners` (currently not done — flagged in the comment at `src/index.tsx:7`).
+**Token streaming.** `BitnetEngine::generate()` takes a `TokenCallback` (`std::function<CallbackResult(const std::string&)>`). The JNI layer calls back into Kotlin's `emitToken(handle, requestId, token)`, which fires a `BitnetToken` JS event via `DeviceEventManagerModule.RCTDeviceEventEmitter`. The JS `Engine.generate()` filters events by `event.handle === this.handle && event.requestId === requestId` — both keys are required so back-to-back calls on the same engine don't cross-talk. On iOS, `NativeEventEmitter` requires the module to implement `supportedEvents`/`startObserving`/`stopObserving` — these are wired in `ios/Bitnet.mm`, so the event channel works on iOS today; only the inference engine methods remain stubbed.
 
 **Threading.** `generate()` runs on a `Thread` spawned by `BitnetModule.kt` so it doesn't block the JS thread. The C++ engine itself is single-threaded per instance: `generate()` is not safe to call concurrently on one `BitnetEngine`; `cancel()` is safe from any thread (atomic flag checked in the decode loop).
 
 **Symbol visibility on Android.** If you add a new JNI entry point and it can't be found at runtime, double-check it's marked `JNIEXPORT` (or `extern "C"` with default visibility). The CMake config forces default visibility but `-fvisibility=hidden` slipping into compile flags would silently break things.
 
-**iOS port status.** When porting iOS: reuse `bitnet_engine.{h,cpp}` from the Android tree (no changes needed by design). The Obj-C++ bridge in `ios/Bitnet.mm` should mirror what `BitnetModule.kt` does and wire `supportedEvents` for `NativeEventEmitter`.
+**iOS port status.** When porting iOS: reuse `bitnet_engine.{h,cpp}` from the Android tree (no changes needed by design). The Obj-C++ bridge in `ios/Bitnet.mm` already wires the `NativeEventEmitter` contract (`supportedEvents`/`startObserving`/`stopObserving`) and the model-lifecycle methods; the remaining work is the inference engine methods (`loadModel`/`generate`/`applyChatTemplate`/`getModelInfo`, currently `E_NOT_IMPLEMENTED` stubs), which should mirror what `BitnetModule.kt` does.
 
 ## Conventions
 
 - Prettier config lives in `package.json::prettier` (single quotes, 2-space, trailing comma `es5`).
 - The library uses `react-native-builder-bob` (`module` ESM + `typescript` targets) — never hand-edit `lib/`.
 - Don't add `npm install`/`npm run` instructions; this repo is Yarn-only.
-- ADRs are referenced in code comments (e.g. "see ADR-001" in `android/build.gradle`) but the documents themselves aren't checked in here.
+- ADRs are referenced in code comments (e.g. "see ADR-001" in `android/build.gradle`) and the documents themselves live under `docs/adr/` (`001-arm64-only.md`, `002-engine-design.md`, `003-streaming-api.md`).
 - Detailed API reference is the canonical doc surface at `docs/api/` (one file per resource: `engine.md`, `chat-completions.md`, `models.md`, `types.md`, `errors.md`, `events.md`, `streaming.md`). Update it alongside any `src/index.tsx` or `src/models.ts` change — follow `.claude/skills/update-api-reference/SKILL.md` and hand off to `@doc-sync-auditor` for the cross-check.

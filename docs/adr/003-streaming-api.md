@@ -16,7 +16,7 @@ A third option, **C++ TurboModule with JSI**, would let the native side hold a J
 
 **TurboModule + JNI, with method calls going down as Promises and tokens coming up as `DeviceEventEmitter` events.** Specifically:
 
-- `nativeGenerate(handle, requestId, params)` is a TurboModule method that returns `Promise<GenerationResult>`. It resolves once (at EOS, cancel, or abort).
+- `generate(handle, requestId, params)` is the TurboModule spec method (`src/NativeBitnet.ts`) that returns `Promise<GenerationResult>`. It resolves once (at EOS, cancel, or abort). (`nativeGenerate` is the separate `private external` JNI entry point in `BitnetModule.kt`.)
 - Tokens fire as `BitnetToken` events carrying `{ handle, requestId, token }` ([BitnetModule.kt:65-68](../../android/src/main/java/com/bitnet/BitnetModule.kt#L65-L68)). The JS layer demultiplexes by handle + requestId.
 - `engine.cancel()` resolves the Promise with `finishReason: 'cancelled'` and partial text. It does **not** reject — partial text is typically still useful (the user already saw it on screen) and `try/catch` shouldn't be the cancel idiom.
 - `AbortSignal` mid-stream rejects with `AbortError`, matching the Web contract.
@@ -41,7 +41,7 @@ A third option, **C++ TurboModule with JSI**, would let the native side hold a J
 ## References
 
 - [src/index.tsx](../../src/index.tsx) — `Engine.generate` / `Engine.stream` implementation, AbortSignal wiring.
-- [src/NativeBitnet.ts](../../src/NativeBitnet.ts) — TurboModule spec, `nativeGenerate(handle, requestId, ...)`.
+- [src/NativeBitnet.ts](../../src/NativeBitnet.ts) — TurboModule spec, `generate(handle, requestId, ...)`.
 - [BitnetModule.kt](../../android/src/main/java/com/bitnet/BitnetModule.kt) — single-flight gate, `emitToken` payload shape, worker-thread spawn.
 - [bitnet_jni.cpp](../../android/src/main/cpp/bitnet_jni.cpp) — JNI callback bridge.
 - [sequence-streaming.md](../sequence-streaming.md) — end-to-end walk-through of one chat turn.
