@@ -53,47 +53,29 @@ type LoadState =
   | { phase: 'ready' }
   | { phase: 'error'; message: string };
 
-// Manual renderer for microsoft/bitnet-b1.58-2B-4T-gguf's training format.
-// The GGUF does ship a tokenizer.chat_template, but it's a custom Jinja
-// string that llama.cpp's pattern-matcher doesn't recognize, so
-// applyChatTemplate produces a broken approximation. The template's actual
-// shape, decoded from the model's metadata, is:
+// Manual renderer for microsoft/bitnet-b1.58-2B-4T's training format.
+// BitNet-b1.58-2B-4T is a Llama-3 architecture model and was trained on the
+// standard Llama-3 chat template — the same markup the validated engine test
+// harness uses to produce correct output:
 //
-//   {bos_token}Human: {user}\n\nBITNETAssistant: {assistant}{eos_token}...
+//   <|begin_of_text|><|start_header_id|>{role}<|end_header_id|>\n\n
+//   {content}<|eot_id|>...<|start_header_id|>assistant<|end_header_id|>\n\n
 //
-// (Literally "BITNETAssistant" — not "Assistant". This is what the model
-// was trained on; deviating produces gibberish.) The template has no system
-// role; we prepend system content to the first user turn so it still
-// reaches the context window.
+// We render it manually rather than calling engine.applyChatTemplate (which
+// routes through llama.cpp's GGUF-metadata template path) so the format is
+// pinned and can't drift if the metadata template fails to pattern-match.
+// Llama-3 has a native system role, so system turns get their own header
+// instead of being folded into the first user message.
 function renderBitnetPrompt(messages: ChatMessage[]): string {
-  const BOS = '<s>'; // bos_token for the model's Llama tokenizer
-  let out = BOS;
-  let pendingSystem = '';
-  let lastWasUser = false;
+  let out = '<|begin_of_text|>';
   for (const m of messages) {
-    if (m.role === 'system') {
-      pendingSystem += m.content + '\n\n';
-    } else if (m.role === 'user') {
-      const content = pendingSystem
-        ? `${pendingSystem}${m.content}`
-        : m.content;
-      out += `Human: ${content}\n\nBITNETAssistant: `;
-      pendingSystem = '';
-      lastWasUser = true;
-    } else if (m.role === 'assistant') {
-      // No eos here — keeps the trailing prompt open for the model to
-      // continue from "BITNETAssistant: " on the next turn.
-      out += m.content;
-      lastWasUser = false;
-    }
+    out += `<|start_header_id|>${m.role}<|end_header_id|>\n\n`;
+    out += `${m.content}<|eot_id|>`;
   }
-  // If the conversation ends on an assistant turn (e.g. regenerating), the
-  // upstream template appends another "Human:" prefix; we mirror that by
-  // ending on an open prompt only when we just appended a user turn. When
-  // we just appended an assistant turn (replay case), open a fresh turn.
-  if (!lastWasUser) {
-    out += '\n\nHuman: \n\nBITNETAssistant: ';
-  }
+  // Open the assistant turn so the model generates a response (mirrors the
+  // engine harness's add_assistant_header=true). The trailing header has no
+  // content and no <|eot_id|>, leaving the prompt open for continuation.
+  out += '<|start_header_id|>assistant<|end_header_id|>\n\n';
   return out;
 }
 
